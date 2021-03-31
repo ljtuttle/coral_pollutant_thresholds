@@ -1,0 +1,1866 @@
+---
+title: 'Bayesian dose-response meta-analysis: Corals and chemical pollutants'
+author: "Eileen M. Nalley and Lillian J. Tuttle"
+date: "3/30/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(plotly)
+library(brms)
+library(bayesplot)
+library(shinystan)
+library(tidybayes)
+library(ggridges)
+library(ggpubr)
+library(rstan)
+library(kableExtra)
+
+#These options help Stan run faster:
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+#full dataset with all pollutants:
+pollute <- as.data.frame(read.csv("./pollution_data.csv", header=TRUE))
+```
+
+# I. Data manipulation
+
+## A. Cleaning up and organizing data
+
+```{r, echo=FALSE, warning=FALSE}
+# changing things to numeric & character as needed
+pollute <- pollute %>% #converting appropriate columns to numeric...
+  mutate_at(vars(level.converted.to.ug.L, N.for.computing.average, 
+                 exposure.duration.in.days, Standardized.response.level, 
+                 Standardized.SE, Standardized.SD, N.for.computing.average.1,
+                 Time.to.response..numeric, Duration.of.response..numeric), as.character) %>% 
+  mutate_at(vars(level.converted.to.ug.L, N.for.computing.average, 
+                 exposure.duration.in.days, Standardized.response.level, 
+                 Standardized.SE, Standardized.SD, N.for.computing.average.1,
+                 Time.to.response..numeric, Duration.of.response..numeric), as.numeric)
+
+# creating new columns for:
+pollute <- pollute %>%
+# 1) RefID and Experiment together,
+  mutate(RefIDExp = paste(RefID, Experiment.Number, sep = "_")) %>% 
+# 2) genus and species together,
+  mutate(Gsp = paste(Current.genus.name, Current.species.name, sep = " ")) %>% 
+# 3) log10(x + 1) transformation of exposure concentration,
+  mutate(log10_1_ug_L = log10(level.converted.to.ug.L + 1)) %>% 
+# 4) "cumulative exposure" = concentration*duration
+  mutate(CumExp = level.converted.to.ug.L*exposure.duration.in.days) %>%
+  select(RefID, RefIDExp, CONTROL, Pollutant.Class, Pollutant, Response.type, Current.genus.name, Gsp, Coral.age.class, level.converted.to.ug.L, log10_1_ug_L, CumExp, exposure.duration.in.days, Standardized.unit.of.measurement, Standardized.response.level, Standardized.SE, Standardized.SD, N.for.computing.average.1) %>%
+# 5) conversion factor (multiplier) from ug/L to umol/L
+  mutate(
+    ug.to.umol.mult = case_when(
+      Pollutant == "Aluminum" ~ 0.03706,
+      Pollutant == "Cadmium" ~ 0.008896,
+      Pollutant == "Cobalt" ~ 0.01697,
+      Pollutant == "Copper" ~ 0.01574,
+      Pollutant == "Gallium" ~ 0.01434,
+      Pollutant == "Iron" ~ 0.01791,
+      Pollutant == "Lead" ~ 0.004826,
+      Pollutant == "Manganese" ~ 0.0182,
+      Pollutant == "Mercury" ~ 0.004985,
+      Pollutant == "Nickel" ~ 0.01704,
+      Pollutant == "Tin" ~ 0.008424,
+      Pollutant == "Vanadium" ~ 0.01963,
+      Pollutant == "Zinc" ~ 0.0153
+    ), .after = Pollutant
+  ) %>% 
+# 6) converted values in molar concentration (umol/L)
+  mutate(level.umol.L = level.converted.to.ug.L * ug.to.umol.mult,
+         .after = CumExp) %>% 
+  mutate(log10_1_umol_L = log10(level.umol.L + 1), .after = level.umol.L)
+``` 
+  
+## B. Creation of data subsets
+  
+```{r, echo=FALSE, warning=FALSE}
+# creating subset datasets for different stressors' effects on coral responses
+copper.fert <- pollute %>% filter(Response.type == "fertilization success") %>% 
+  filter(Pollutant == "Copper")
+copper.larvsurv <- pollute %>% filter(Response.type == "Larval survival") %>% 
+  filter(Pollutant == "Copper") %>% 
+  filter(!is.na(Standardized.SE)) #remove study that had no estimate of error
+copper.larvsett <- pollute %>% filter(Response.type == "Larval settlement") %>% 
+  filter(Pollutant == "Copper") %>% 
+  filter(!RefID == "Cu04") %>% #removes study for which control response was 0
+  filter(!RefIDExp == "Cu19_1") #removes study for which <11% settlement for control
+copper.larvswim <- pollute %>% 
+  filter(Response.type == "Larval swimming distance") %>% 
+  filter(Pollutant == "Copper") %>% 
+  filter(!is.na(Standardized.SE)) #remove study that had no estimate of error
+copper.chla <- pollute %>% filter(Response.type == "chl-a concentration") %>% 
+  filter(Pollutant == "Copper")
+copper.chla.ug.cm2 <- copper.chla %>% 
+  filter(Standardized.unit.of.measurement == "ug/cm2")
+copper.chla.pg.cell <- copper.chla %>% 
+  filter(Standardized.unit.of.measurement == "pg/cell")
+copper.fvfm <- pollute %>% 
+  filter(Response.type == "maximum quantum yield - Fv/Fm") %>% 
+  filter(Pollutant == "Copper") %>% 
+  filter(!CONTROL == "-1") %>% 
+  filter(!RefID == "Cu12")
+diuron.fvfm <- pollute %>% 
+  filter(Response.type == "maximum quantum yield - Fv/Fm") %>% 
+  filter(Pollutant == "Diuron") %>% 
+  filter(!CONTROL == "-1" & !CONTROL == "-2") %>% 
+  filter(Coral.age.class == "adult")
+metal.fert <- pollute %>% filter(Response.type == "fertilization success") %>% 
+  filter(Pollutant.Class == "Metal")
+
+#look at top of data subsets
+#head(copper.fert)
+#head(copper.larvsurv)
+#head(copper.larvsett)
+#head(copper.larvswim)
+#head(copper.chla.ug.cm2)
+#head(copper.chla.pg.cell)
+#head(copper.fvfm)
+#head(diuron.fvfm)
+#head(metal.fert)
+
+#count number of species (or articles/experiments/pollutants) in data subsets
+#copper.fert %>% count(Gsp) #n=12 species, 5 genera
+#copper.larvsurv %>% count(Gsp) #n=3 species, 3 genera
+#copper.larvsett %>% count(Gsp) #n=2 species, 1 genera
+#copper.larvswim %>% count(Gsp) #n=2 species, 1 genera
+#copper.chla.ug.cm2 %>% count(RefID) #n=3
+#copper.chla.ug.cm2 %>% count(RefIDExp) #n=4
+#copper.chla.ug.cm2 %>% count(Gsp) #n=3 species, 3 genera
+#copper.chla.pg.cell %>% count(RefID) #n=3
+#copper.chla.pg.cell %>% count(RefIDExp) #n=5
+#copper.chla.pg.cell %>% count(Gsp) #n=3 species, 3 genera
+#copper.fvfm %>% count(Gsp) #n=2 species, 1 genera
+#diuron.fvfm %>% count(Gsp) #n=7 species, 5 genera
+#metal.fert %>% count(Pollutant, sort = TRUE)
+```
+
+
+These data subsets contain information from multiple articles (**RefID**) and studies/experiments (**RefIDExp**) within those articles about the effects of trace metals (copper or all metals) and a pesticide (diuron) on various coral responses. We would like to explore the dose-response relationship between metal/pesticide 'dose' and these responses:
+
+- Some responses are expressed as a percent (%) success (e.g., fertilization, larval survival, settlement), some as a proportion (0 to 1.0, e.g., quantum yield), and some in other ways (e.g., velocity or concentrations).   
+- 'Dose' can be quantified as metal exposure concentration (ug/L), exposure duration (days), or as "cumulative exposure", for which we multiply concentration and duration (ug x day/L).
+
+Each study/experiment (RefIDExp) contains one control group and multiple treatment groups (due to using multiple doses, for instance). Thus, I have added the categorical vector '**CONTROL**', within which is one control (CONTROL=="1") and at least one treatment (CONTROL=="0") that corresponds to that control.
+  
+  
+# II. Modeling the dose-response relationship 
+
+## Model and parameters
+
+y = e0 * (1 - emax * x^lambda / (e50^lambda + x^lambda)), where
+  
+y is the response level (e.g., % fertilization),
+x is the dose concentration,
+e0 is baseline level of y (when x approaches zero), note that this is undefined when x=0,
+emax is the maximum response as x approaches infinity, expressed as a proportion of e0,
+lambda is the sensitivity to x (steepness of response), and
+e50 is the dose at which the response is halfway between e0 and emax.
+  
+## A. Bayesian meta-analysis with brms models
+  
+### 1. brms with Copper - gamete fertilization success
+  
+Let's plot the raw data to assess whether the non-linear, Emax model parameterization would be appropriate...
+  
+```{r, echo=FALSE, warning=FALSE}
+# COPPER concentration vs. fertilization success
+copper.fert.conc <- ggplot(copper.fert, 
+                           aes(x = level.converted.to.ug.L,
+                               y = Standardized.response.level,
+                               color = RefIDExp,
+                               ymin = Standardized.response.level-Standardized.SE,
+                               ymax = Standardized.response.level+Standardized.SE)) + 
+  geom_pointrange() +
+  ggtitle("Copper - Fertilization success rate") +
+  labs(x = "Copper concentration (ug/L)",
+       y = "Fertilization success (%)",
+       color = "Experiment") +
+  theme_classic() + scale_x_log10()
+
+copper.fert.conc + geom_smooth(method = lm, se = FALSE) #linear fit
+copper.fert.conc + geom_smooth(method = loess, se = FALSE) #smooth (non-linear) fit
+copper.fert.conc
+ggplotly(copper.fert.conc) #so that I can isolate particular experiments
+```
+
+Now let's use brms to model the dose-response relationship between copper and fertilization:
+
+```{r, echo=FALSE}
+## setting max fert level to 100 for the two cases in which data extracted from figures were above 100 -- note that these were from Gissi et al. 2017, for which the response is % of control as opposed to raw percent fertilized
+max(copper.fert$Standardized.response.level)
+copper.fert$StdResp100 <- copper.fert$Standardized.response.level
+copper.fert$StdResp100[copper.fert$StdResp100>100] = 100
+max(copper.fert$StdResp100)
+
+#EC50 AND LAMBDA GROUPED BY STUDY NESTED WITHIN ARTICLE
+fit_copper.fert <- brm(
+  bf(StdResp100 | se(Standardized.SE, sigma = TRUE) ~ 
+       e0 * (1 - emax*level.converted.to.ug.L^lambda /
+       (e50^lambda+level.converted.to.ug.L^lambda)), 
+     e0 ~ 1, emax ~ 1, e50 ~ 1 + (1|RefID/RefIDExp) , 
+     lambda ~ 1 + (1|RefID/RefIDExp),
+     nl = TRUE
+     ),
+  data = copper.fert,
+  family = gaussian(),
+  prior = c(
+    prior(normal(100,10), nlpar = "e0", lb = 0, ub = 100),
+    prior(normal(0.5,0.2), nlpar = "emax", lb = 0, ub = 1),
+    prior(normal(50, 10), nlpar = "e50", lb = 0, ub = 1000),
+    prior(normal(0, 10), nlpar = "lambda", lb = 0)
+  ), control = list(adapt_delta = 0.9999, max_treedepth = 15),
+  cores = 4, chains = 4, iter = 2000, warmup = 1000, seed = 19012018)
+```
+  
+#### a. Bayesian model summary
+  
+```{r, echo=FALSE}
+#EC50 AND LAMBDA GROUPED BY STUDY NESTED WITHIN ARTICLE
+summary(fit_copper.fert) #no errors/warnings
+#EC50 is 48.6
+posterior_summary(fit_copper.fert)
+bayes_R2(fit_copper.fert) #Bayesian R-squared = 0.932
+#plot(fit_copper.fert) #need to hit Enter in Console
+#launch_shinystan(fit_copper.fert) #will launch web-based tool -- usable only when Console is executing this command, so will need to STOP when you want to continue in R
+```
+
+Results look clean and no warnings from the model. 
+    
+#### b. Plots of Bayesian model results and EC50 posterior distributions by article
+  
+```{r, echo=FALSE, warning=FALSE}
+#This code adapted from (brmstools package is no longer being maintained, so its author gave replication of figure using tidybayes and ggridges packages): https://github.com/mvuorre/brmstools
+#which was further adapted from: http://mjskay.github.io/tidybayes/articles/tidy-brms.html
+
+# Assign model of choice:
+mod <- fit_copper.fert
+mod_fixef <- fixef(mod)
+
+# Group-specific effects are deviations + average
+out_r_e50 <- mod %>% 
+  spread_draws(r_RefID__e50[RefID,term], b_e50_Intercept) %>% 
+  mutate(b_e50_Intercept = r_RefID__e50 + b_e50_Intercept) 
+out_r_lambda <- mod %>% 
+  spread_draws(r_RefID__lambda[RefID,term], b_lambda_Intercept) %>% 
+  mutate(b_lambda_Intercept = r_RefID__lambda + b_lambda_Intercept) 
+
+# Average effects
+out_f_e0 <- mod %>% 
+  spread_draws(b_e0_Intercept) %>% 
+  mutate(RefID = "Average") %>% ungroup()
+out_f_emax <- mod %>% 
+  spread_draws(b_emax_Intercept) %>% 
+  mutate(RefID = "Average") %>% ungroup()
+out_f_e50 <- mod %>% 
+  spread_draws(b_e50_Intercept) %>% 
+  mutate(RefID = "Average")
+out_f_lambda <- mod %>% 
+  spread_draws(b_lambda_Intercept) %>% 
+  mutate(RefID = "Average")
+
+# Combine average and study-specific effects' data frames
+out_all_e50 <- bind_rows(out_r_e50, out_f_e50) %>% 
+  ungroup() %>%
+  mutate(RefID = fct_relevel(RefID, "Average"))
+out_all_lambda <- bind_rows(out_r_lambda, out_f_lambda) %>% 
+  ungroup() %>%
+  mutate(RefID = fct_relevel(RefID, "Average"))
+
+# Data frames of summary numbers
+out_all_sum_e0 <- out_f_e0 %>% group_by(RefID) %>% 
+  mean_qi(b_e0_Intercept)
+out_all_sum_emax <- out_f_emax %>% group_by(RefID) %>% 
+  mean_qi(b_emax_Intercept)
+out_all_sum_e50 <- out_all_e50 %>% group_by(RefID) %>% 
+  mean_qi(b_e50_Intercept)
+out_all_sum_lambda <- out_all_lambda %>% group_by(RefID) %>% 
+  mean_qi(b_lambda_Intercept)
+
+# Renaming beta values for all parameters and groupings
+e0_fit_fert <- out_all_sum_e0$b_e0_Intercept
+emax_fit_fert <- out_all_sum_emax$b_emax_Intercept
+e50_fit_fert <- out_all_sum_e50$b_e50_Intercept
+lambda_fit_fert <- out_all_sum_lambda$b_lambda_Intercept
+
+# Equation for average values of all parameters
+equ_average <- function(x){
+  e0_fit_fert * (1 - emax_fit_fert*x^lambda_fit_fert[1]/
+       (e50_fit_fert[1]^lambda_fit_fert[1] + x^lambda_fit_fert[1]))}
+# Generic version of above
+equ_vector <- function(x){
+  e0_fit_fert * (1 - emax_fit_fert*x^lambda_fit_fert/
+       (e50_fit_fert^lambda_fit_fert + x^lambda_fit_fert))
+  }
+
+# Equations for group-level values of all parameters
+equ_group2 <- function(x){
+  e0_fit_fert * (1 - emax_fit_fert*x^lambda_fit_fert[2]/
+       (e50_fit_fert[2]^lambda_fit_fert[2] + x^lambda_fit_fert[2]))}
+equ_group3 <- function(x){
+  e0_fit_fert * (1 - emax_fit_fert*x^lambda_fit_fert[3]/
+       (e50_fit_fert[3]^lambda_fit_fert[3] + x^lambda_fit_fert[3]))}
+equ_group4 <- function(x){
+  e0_fit_fert * (1 - emax_fit_fert*x^lambda_fit_fert[4]/
+       (e50_fit_fert[4]^lambda_fit_fert[4] + x^lambda_fit_fert[4]))}
+equ_group5 <- function(x){
+  e0_fit_fert * (1 - emax_fit_fert*x^lambda_fit_fert[5]/
+       (e50_fit_fert[5]^lambda_fit_fert[5] + x^lambda_fit_fert[5]))}
+equ_group6 <- function(x){
+  e0_fit_fert * (1 - emax_fit_fert*x^lambda_fit_fert[6]/
+       (e50_fit_fert[6]^lambda_fit_fert[6] + x^lambda_fit_fert[6]))}
+equ_group7 <- function(x){
+  e0_fit_fert * (1 - emax_fit_fert*x^lambda_fit_fert[7]/
+       (e50_fit_fert[7]^lambda_fit_fert[7] + x^lambda_fit_fert[7]))}
+equ_group8 <- function(x){
+  e0_fit_fert * (1 - emax_fit_fert*x^lambda_fit_fert[8]/
+       (e50_fit_fert[8]^lambda_fit_fert[8] + x^lambda_fit_fert[8]))}
+equ_group9 <- function(x){
+  e0_fit_fert * (1 - emax_fit_fert*x^lambda_fit_fert[9]/
+       (e50_fit_fert[9]^lambda_fit_fert[9] + x^lambda_fit_fert[9]))}
+equ_group10 <- function(x){
+  e0_fit_fert * (1 - emax_fit_fert*x^lambda_fit_fert[10]/
+       (e50_fit_fert[10]^lambda_fit_fert[10] + x^lambda_fit_fert[10]))}
+
+copper.fert2 = data.frame(x=c(0:10000))
+copper.fert2 = data.frame(x=c(0:10000),
+                    fxn_lo = sapply(copper.fert2$x, FUN = function(x){
+  mod_fixef[1,3]*(1 - mod_fixef[2,3] * x^mod_fixef[4,3]/
+       (mod_fixef[3,3]^mod_fixef[4,3] + x^mod_fixef[4,3]))
+}),
+                    fxn_up = sapply(copper.fert2$x, FUN = function(x){
+  mod_fixef[1,4]*(1 - mod_fixef[2,4] * x^mod_fixef[4,4]/
+       (mod_fixef[3,4]^mod_fixef[4,4] + x^mod_fixef[4,4]))
+}))
+
+## Bayesian model results plot
+plot_brm_copper.fert2 <- ggplot(data = copper.fert,
+       aes(x = level.converted.to.ug.L, y = StdResp100)) +
+  geom_ribbon(data = copper.fert2, aes(x=x, ymin = fxn_lo, ymax = fxn_up), 
+              fill = "grey70", alpha = .4, 
+              show.legend=FALSE, inherit.aes=FALSE) +
+  geom_point(col = "grey") +
+  geom_vline(xintercept=e50_fit_fert[1], linetype="dashed", color = "red") +
+  stat_function(fun = equ_group2, color = "gray50") +
+  stat_function(fun = equ_group3, color = "gray50") +
+  stat_function(fun = equ_group4, color = "gray50") +
+  stat_function(fun = equ_group5, color = "gray50") +
+  stat_function(fun = equ_group6, color = "gray50") +
+  stat_function(fun = equ_group7, color = "gray50") +
+  stat_function(fun = equ_group8, color = "gray50") +
+  stat_function(fun = equ_group9, color = "gray50") +
+  stat_function(fun = equ_group10, color = "gray50") +
+  stat_function(fun = equ_average, size = 1) +
+  labs(x = "", y = "Fertilization\nsuccess (%)") +
+  scale_x_log10(limits = c(0.1,10000),
+                breaks=c(0.1,1,10,100,1000,10000,e50_fit_fert[1]), 
+                label=c("0.1","1","10","","1000","10,000",round(e50_fit_fert[1],digits=1))) +
+  theme_classic()
+
+plot_brm_copper.fert2
+
+## EC50 Plot
+plot_EC50_copper.fert <- out_all_e50 %>%   
+  ggplot(aes(b_e50_Intercept, RefID)) +
+  geom_density_ridges(
+    rel_min_height = 0.01, 
+    col = NA,
+    scale = 1) +
+  geom_pointintervalh(
+    data = out_all_sum_e50, size = 1) +
+  geom_text(
+    data = mutate_if(out_all_sum_e50, is.numeric, round, 1),
+    # Use glue package to combine strings
+    aes(label = glue::glue("{b_e50_Intercept} [{.lower}, {.upper}]"), x = Inf),
+    hjust = "inward") +
+  labs(x = expression(paste("E", C[50], " posterior distribution (", mu, "g/L Cu)")), 
+       y = "Article") +
+  scale_x_continuous(limits = c(-25,250)) + 
+  theme_bw() + theme(panel.grid.major.y = element_blank())
+
+plot_EC50_copper.fert
+```
+  
+#### c. ECx estimates
+
+```{r}
+Cu_fert <- fixef(fit_copper.fert)
+
+lambda <- Cu_fert[4,1]
+e50 <- Cu_fert[3,1]
+lambda_lo <- Cu_fert[4,3]
+e50_lo <- Cu_fert[3,3]
+lambda_up <- Cu_fert[4,4]
+e50_up <- Cu_fert[3,4]
+
+eci <- c(5,10,20,50)
+i <- 1 - eci/100
+Estimate <- e50 * ((1-i)/i)^(1/lambda)
+Q2.5 <- e50_lo * ((1-i)/i)^(1/lambda_lo)
+Q97.5 <- e50_up * ((1-i)/i)^(1/lambda_up)
+
+Age_class <- c("GAMETES", "GAMETES", "GAMETES", "GAMETES")
+Response <- c("Fertilization success rate","Fertilization success rate",
+              "Fertilization success rate","Fertilization success rate")
+Pollutant <- c("Copper", "", "", "")
+ECx <- c('EC5', 'EC10', 'EC20', 'EC50')
+Cu_fert_df <- data.frame(cbind(Age_class, Response, Pollutant, 
+                               ECx, Estimate, Q2.5, Q97.5))
+Cu_fert_df <- Cu_fert_df %>% #converting appropriate columns to numeric...
+  mutate_at(vars(Estimate, Q2.5, Q97.5), as.character) %>% 
+  mutate_at(vars(Estimate, Q2.5, Q97.5), as.numeric) %>% 
+  mutate_if(is.numeric, round, digits=1)
+kbl(Cu_fert_df, align = "l", 
+    col.names = c("Coral age class", "Coral response", "Pollutant", 
+                  "ECx", "Estimate", "Q2.5", "Q97.5")) %>%
+  kable_paper(full_width = F) %>%
+  column_spec(1, bold = T) %>%
+  collapse_rows(columns = 1:2, valign = "top")
+```
+  
+  
+### 2. brms with Copper - larval survival
+  
+Let's plot the raw data to assess whether the non-linear, Emax model parameterization would be appropriate...
+  
+```{r, echo=FALSE, warning=FALSE}
+# COPPER concentration vs. LARVAL SURVIVAL
+copper.larvsurv.conc <- ggplot(copper.larvsurv, 
+                           aes(x = level.converted.to.ug.L,
+                               y = Standardized.response.level,
+                               color = RefIDExp,
+                               ymin = Standardized.response.level-Standardized.SE,
+                               ymax = Standardized.response.level+Standardized.SE)) + 
+  geom_pointrange() +
+  ggtitle("Copper - Larval survival rate") +
+  labs(x = "Copper concentration (ug/L)",
+       y = "Percent of larvae that survived (%)",
+       color = "Experiment") +
+  theme_classic() + scale_x_log10(limits = c(1,1000))
+
+copper.larvsurv.conc + geom_smooth(method = lm, se = FALSE) #linear fit
+copper.larvsurv.conc + geom_smooth(method = loess, se = FALSE) #smooth (non-linear) fit
+copper.larvsurv.conc
+ggplotly(copper.larvsurv.conc) #so that I can isolate particular experiments
+```
+
+Note that it's possible that E0 could differ by study/article. We will group within this variable. Now let's use brms to model the dose-response relationship between copper and larval survival:
+
+```{r, echo=FALSE}
+## setting max resp level to 100 for any cases in which data extracted from figures were above 100
+max(copper.larvsurv$Standardized.response.level)
+copper.larvsurv$StdResp100 <- copper.larvsurv$Standardized.response.level
+copper.larvsurv$StdResp100[copper.larvsurv$StdResp100>100] = 100
+max(copper.larvsurv$StdResp100)
+copper.larvsurv_noCu05 <- copper.larvsurv %>% filter(!RefID == "Cu05")
+
+#EC50 AND E0 GROUPED BY STUDY NESTED WITHIN ARTICLE
+fit_copper.larvsurv <- brm(
+  bf(StdResp100 | se(Standardized.SE, sigma = TRUE) ~ 
+       e0 * (1 - emax*level.converted.to.ug.L^lambda /
+       (e50^lambda+level.converted.to.ug.L^lambda)),
+     e0 ~ 1 + (1|RefID/RefIDExp), emax ~ 1, 
+     e50 ~ 1 + (1|RefID/RefIDExp), lambda ~ 1,
+     nl = TRUE),
+  data = copper.larvsurv_noCu05,
+  family = gaussian(),
+  prior = c(
+    prior(normal(90,10), nlpar = "e0", lb = 0, ub = 100),
+    prior(normal(0.5,0.2), nlpar = "emax", lb = 0, ub = 1),
+    prior(normal(105,15), nlpar = "e50", lb = 1, ub = 1000),
+    prior(normal(0, 10), nlpar = "lambda", lb = 0)
+  ), control = list(adapt_delta = 0.9999999),
+  cores = 4, chains = 4, iter = 2000, warmup = 1000, seed=2704)
+```
+
+#### a. Bayesian model summary
+  
+```{r, echo=FALSE}
+#EC50 AND E0 GROUPED BY STUDY NESTED WITHIN ARTICLE
+summary(fit_copper.larvsurv)
+#EC50 is 101.0
+posterior_summary(fit_copper.larvsurv)
+bayes_R2(fit_copper.larvsurv) #Bayesian R-squared = 0.844
+#plot(fit_copper.larvsurv) #need to hit Enter in Console
+```
+  
+#### b. Plots of Bayesian model results and EC50, E0 posterior distributions by experiment
+  
+```{r, echo=FALSE, warning=FALSE}
+#Model random effects structure: 
+#e0 ~ 1 + (1|RefID/RefIDExp), emax ~ 1, e50 ~ 1 + (1|RefID/RefIDExp), lambda ~ 1,
+
+# Assign model of choice:
+mod <- fit_copper.larvsurv
+mod_fixef <- fixef(mod)
+
+# Group-specific effects are deviations + average
+out_r_e0 <- mod %>% 
+  spread_draws(r_RefID__e0[RefID,term], b_e0_Intercept) %>% 
+  mutate(b_e0_Intercept = r_RefID__e0 + b_e0_Intercept) 
+out_r_e50 <- mod %>% 
+  spread_draws(r_RefID__e50[RefID,term], b_e50_Intercept) %>% 
+  mutate(b_e50_Intercept = r_RefID__e50 + b_e50_Intercept) 
+
+# Average effects
+out_f_e0 <- mod %>% 
+  spread_draws(b_e0_Intercept) %>% 
+  mutate(RefID = "Average")
+out_f_emax <- mod %>% 
+  spread_draws(b_emax_Intercept) %>% 
+  mutate(RefID = "Average") %>% ungroup()
+out_f_e50 <- mod %>% 
+  spread_draws(b_e50_Intercept) %>% 
+  mutate(RefID = "Average")
+out_f_lambda <- mod %>% 
+  spread_draws(b_lambda_Intercept) %>% 
+  mutate(RefID = "Average") %>% ungroup()
+
+# Combine average and study-specific effects' data frames
+out_all_e0 <- bind_rows(out_r_e0, out_f_e0) %>% 
+  ungroup() %>%
+  mutate(RefID = fct_relevel(RefID, "Average"))
+out_all_e50 <- bind_rows(out_r_e50, out_f_e50) %>% 
+  ungroup() %>%
+  mutate(RefID = fct_relevel(RefID, "Average"))
+
+# Data frames of summary numbers
+out_all_sum_e0 <- out_all_e0 %>% group_by(RefID) %>% 
+  mean_qi(b_e0_Intercept)
+out_all_sum_emax <- out_f_emax %>% group_by(RefID) %>% 
+  mean_qi(b_emax_Intercept)
+out_all_sum_e50 <- out_all_e50 %>% group_by(RefID) %>% 
+  mean_qi(b_e50_Intercept)
+out_all_sum_lambda <- out_f_lambda %>% group_by(RefID) %>% 
+  mean_qi(b_lambda_Intercept)
+
+# Renaming beta values for all parameters and groupings
+e0_fit_surv <- out_all_sum_e0$b_e0_Intercept
+emax_fit_surv <- out_all_sum_emax$b_emax_Intercept
+e50_fit_surv <- out_all_sum_e50$b_e50_Intercept
+lambda_fit_surv <- out_all_sum_lambda$b_lambda_Intercept
+
+# Equation for average values of all parameters
+equ_average <- function(x){
+  e0_fit_surv[1]*(1 - emax_fit_surv * x^lambda_fit_surv /
+                    (e50_fit_surv[1]^lambda_fit_surv + x^lambda_fit_surv))
+}
+# Generic version of above
+equ_vector <- function(x){
+  e0_fit_surv*(1 - emax_fit_surv * x^lambda_fit_surv /
+                 (e50_fit_surv^lambda_fit_surv + x^lambda_fit_surv))
+}
+
+# Equations for group-level values of all parameters
+equ_group2 <- function(x){
+  e0_fit_surv[2]*(1 - emax_fit_surv * x^lambda_fit_surv /
+                    (e50_fit_surv[2]^lambda_fit_surv + x^lambda_fit_surv))}
+equ_group3 <- function(x){
+  e0_fit_surv[3]*(1 - emax_fit_surv * x^lambda_fit_surv /
+                    (e50_fit_surv[3]^lambda_fit_surv + x^lambda_fit_surv))}
+equ_group4 <- function(x){
+  e0_fit_surv[4]*(1 - emax_fit_surv * x^lambda_fit_surv /
+                    (e50_fit_surv[4]^lambda_fit_surv + x^lambda_fit_surv))}
+
+copper.larvsurv2 = data.frame(x=c(0:10000))
+copper.larvsurv2 = data.frame(x=c(0:10000),
+                    fxn_lo = sapply(copper.larvsurv2$x, FUN = function(x){
+  mod_fixef[1,3]*(1 - mod_fixef[2,3] * x^mod_fixef[4,3]/
+       (mod_fixef[3,3]^mod_fixef[4,3] + x^mod_fixef[4,3]))
+}),
+                    fxn_up = sapply(copper.larvsurv2$x, FUN = function(x){
+  mod_fixef[1,4]*(1 - mod_fixef[2,4] * x^mod_fixef[4,4]/
+       (mod_fixef[3,4]^mod_fixef[4,4] + x^mod_fixef[4,4]))
+}))
+
+## Bayesian model results plot
+plot_brm_copper.larvsurv2 <- ggplot(data = copper.larvsurv_noCu05,
+       aes(x = level.converted.to.ug.L, y = StdResp100)) +
+  geom_ribbon(data = copper.larvsurv2, aes(x=x, ymin = fxn_lo, ymax = fxn_up), 
+              fill = "grey70", alpha = .4, 
+              show.legend=FALSE, inherit.aes=FALSE) +
+  geom_point(col = "grey") +
+  geom_vline(xintercept=e50_fit_surv[1], linetype="dashed", color = "red") +
+  stat_function(fun = equ_group2, color = "gray50") +
+  stat_function(fun = equ_group3, color = "gray50") +
+  stat_function(fun = equ_group4, color = "gray50") +
+  stat_function(fun = equ_average, size = 1) +
+  labs(x = "", y = "Larval survival (%)") +
+  scale_x_log10(limits = c(1,1000), breaks=c(1,10,100,1000,e50_fit_surv[1]), 
+                label=c("1","10","","1000","101.0")) +
+  theme_classic()
+
+plot_brm_copper.larvsurv2
+
+# EC50 Plot
+plot_EC50_copper.larvsurv <- out_all_e50 %>%   
+  ggplot(aes(b_e50_Intercept, RefID)) +
+  geom_density_ridges(
+    rel_min_height = 0.01, 
+    col = NA,
+    scale = 1) +
+  geom_pointintervalh(
+    data = out_all_sum_e50, size = 1) +
+  geom_text(
+    data = mutate_if(out_all_sum_e50, is.numeric, round, 1),
+    # Use glue package to combine strings
+    aes(label = glue::glue("{b_e50_Intercept} [{.lower}, {.upper}]"), x = Inf),
+    hjust = "inward") +
+  labs(x = expression(paste(EC[50], " posterior distribution (% larvae survival)")), 
+       y = "Experiment") +
+  scale_x_continuous(limits = c(40,200)) + 
+  theme_bw() + theme(panel.grid.major.y = element_blank())
+
+plot_EC50_copper.larvsurv
+
+# E0 Plot
+plot_E0_copper.larvsurv <- out_all_e0 %>%   
+  ggplot(aes(b_e0_Intercept, RefID)) +
+  geom_density_ridges(
+    rel_min_height = 0.01, 
+    col = NA,
+    scale = 1) +
+  geom_pointintervalh(
+    data = out_all_sum_e0, size = 1) +
+  geom_text(
+    data = mutate_if(out_all_sum_e0, is.numeric, round, 1),
+    # Use glue package to combine strings
+    aes(label = glue::glue("{b_e0_Intercept} [{.lower}, {.upper}]"), x = Inf),
+    hjust = "inward") +
+  labs(x = expression(paste(E[0], " posterior distribution (% larvae survival)")), 
+       y = "Experiment") +
+  scale_x_continuous(limits = c(60,140)) + 
+  theme_bw() + theme(panel.grid.major.y = element_blank())
+
+plot_E0_copper.larvsurv
+```  
+  
+#### c. ECx estimates
+
+```{r}
+Cu_larvsurv <- fixef(fit_copper.larvsurv)
+
+lambda <- Cu_larvsurv[4,1]
+e50 <- Cu_larvsurv[3,1]
+lambda_lo <- Cu_larvsurv[4,3]
+e50_lo <- Cu_larvsurv[3,3]
+lambda_up <- Cu_larvsurv[4,4]
+e50_up <- Cu_larvsurv[3,4]
+
+eci <- c(5,10,20,50)
+i <- 1 - eci/100
+Estimate <- e50 * ((1-i)/i)^(1/lambda)
+Q2.5 <- e50_lo * ((1-i)/i)^(1/lambda_lo)
+Q97.5 <- e50_up * ((1-i)/i)^(1/lambda_up)
+
+Age_class <- c("LARVAE", "LARVAE", "LARVAE", "LARVAE")
+Response <- c("Survival rate","Survival rate",
+              "Survival rate","Survival rate")
+Pollutant <- c("Copper", "", "", "")
+ECx <- c('EC5', 'EC10', 'EC20', 'EC50')
+Cu_larvsurv_df <- data.frame(cbind(Age_class, Response, Pollutant, 
+                               ECx, Estimate, Q2.5, Q97.5))
+Cu_larvsurv_df <- Cu_larvsurv_df %>% #converting appropriate columns to numeric...
+  mutate_at(vars(Estimate, Q2.5, Q97.5), as.character) %>% 
+  mutate_at(vars(Estimate, Q2.5, Q97.5), as.numeric) %>% 
+  mutate_if(is.numeric, round, digits=1)
+kbl(Cu_larvsurv_df, align = "l", 
+    col.names = c("Coral age class", "Coral response", "Pollutant", 
+                  "ECx", "Estimate", "Q2.5", "Q97.5")) %>%
+  kable_paper(full_width = F) %>%
+  column_spec(1, bold = T) %>%
+  collapse_rows(columns = 1:2, valign = "top")
+```
+  
+  
+### 3. brms with Copper - larval settlement
+  
+Let's plot the raw data to assess whether the non-linear, Emax model parameterization would be appropriate...
+  
+```{r, echo=FALSE, warning=FALSE}
+# COPPER concentration vs. LARVAL SETTLEMENT
+copper.larvsett.conc <- ggplot(copper.larvsett, 
+                           aes(x = level.converted.to.ug.L,
+                               y = Standardized.response.level,
+                               color = RefIDExp,
+                               ymin = Standardized.response.level-Standardized.SE,
+                               ymax = Standardized.response.level+Standardized.SE)) + 
+  geom_pointrange() +
+  ggtitle("Copper - Larval settlement rate") +
+  labs(x = "Copper concentration (ug/L)",
+       y = "Settlement rate (%)",
+       color = "Experiment") +
+  theme_classic() + scale_x_log10()
+
+copper.larvsett.conc + geom_smooth(method = lm, se = FALSE) #linear fit
+copper.larvsett.conc + geom_smooth(method = loess, se = FALSE) #smooth (non-linear) fit
+copper.larvsett.conc
+ggplotly(copper.larvsett.conc) #so that I can isolate particular experiments
+```
+
+**Note that there is a lot of variability around E0 -- will want to group on that factor in the model.** Now let's use brms to model the dose-response relationship between copper and larval settlement:
+
+```{r, echo=FALSE}
+## setting max resp level to 100 for any cases in which data extracted from figures were above 100
+max(copper.larvsett$Standardized.response.level)
+copper.larvsett$StdResp100 <- copper.larvsett$Standardized.response.level
+copper.larvsett$StdResp100[copper.larvsett$StdResp100>100] = 100
+max(copper.larvsett$StdResp100)
+
+#EC50 AND E0 GROUPED BY STUDY
+fit_copper.larvsett <- brm(
+  bf(StdResp100 | se(Standardized.SE, sigma = TRUE) ~ 
+       e0 * (1 - emax*level.converted.to.ug.L^lambda /
+       (e50^lambda+level.converted.to.ug.L^lambda)), 
+     e0 ~ 1 + (1|RefIDExp), emax ~ 1, 
+     e50 ~ 1 + (1|RefIDExp), lambda ~ 1,
+     nl = TRUE),
+  data = copper.larvsett,
+  family = gaussian(),
+  prior = c(
+    prior(normal(75,10), nlpar = "e0", lb = 0, ub = 100),
+    prior(normal(0.5,0.2), nlpar = "emax", lb = 0, ub = 1),
+    prior(normal(50, 20), nlpar = "e50", lb = 0, ub = 200),
+    prior(normal(0, 10), nlpar = "lambda", lb = 0)
+  ), control = list(adapt_delta = 0.9999, max_treedepth = 15), 
+  cores = 4, chains = 4, iter = 2000, warmup = 1000, seed = 19012018)
+```
+
+#### a. Bayesian model summary
+  
+```{r, echo=FALSE}
+#EC50 AND E0 GROUPED BY STUDY
+summary(fit_copper.larvsett) 
+#EC50 is 44.80
+posterior_summary(fit_copper.larvsett)
+bayes_R2(fit_copper.larvsett) #Bayesian R-squared = 0.973
+#plot(fit_copper.larvsett) #need to hit Enter in Console
+#launch_shinystan(fit_copper.larvsett2) #will launch web-based tool -- usable only when Console is executing this command, so will need to STOP when you want to continue in R
+```
+  
+#### b. Plots of Bayesian model results and EC50, E0 posterior distributions by experiment
+  
+```{r, echo=FALSE, warning=FALSE}
+#Model random effects structure: 
+#e0 ~ 1 + (1|RefIDExp), emax ~ 1, e50 ~ 1 + (1|RefIDExp), lambda ~ 1,
+
+# Assign model of choice:
+mod <- fit_copper.larvsett
+mod_fixef <- fixef(mod)
+
+# Group-specific effects are deviations + average
+out_r_e0 <- mod %>% 
+  spread_draws(r_RefIDExp__e0[RefIDExp,term], b_e0_Intercept) %>% 
+  mutate(b_e0_Intercept = r_RefIDExp__e0 + b_e0_Intercept) 
+out_r_e50 <- mod %>% 
+  spread_draws(r_RefIDExp__e50[RefIDExp,term], b_e50_Intercept) %>% 
+  mutate(b_e50_Intercept = r_RefIDExp__e50 + b_e50_Intercept) 
+
+# Average effects
+out_f_e0 <- mod %>% 
+  spread_draws(b_e0_Intercept) %>% 
+  mutate(RefIDExp = "Average")
+out_f_emax <- mod %>% 
+  spread_draws(b_emax_Intercept) %>% 
+  mutate(RefIDExp = "Average") %>% ungroup()
+out_f_e50 <- mod %>% 
+  spread_draws(b_e50_Intercept) %>% 
+  mutate(RefIDExp = "Average")
+out_f_lambda <- mod %>% 
+  spread_draws(b_lambda_Intercept) %>% 
+  mutate(RefIDExp = "Average") %>% ungroup()
+
+# Combine average and study-specific effects' data frames
+out_all_e0 <- bind_rows(out_r_e0, out_f_e0) %>% 
+  ungroup() %>%
+  mutate(RefIDExp = fct_relevel(RefIDExp, "Average"))
+out_all_e50 <- bind_rows(out_r_e50, out_f_e50) %>% 
+  ungroup() %>%
+  mutate(RefIDExp = fct_relevel(RefIDExp, "Average"))
+
+# Data frames of summary numbers
+out_all_sum_e0 <- out_all_e0 %>% group_by(RefIDExp) %>% 
+  mean_qi(b_e0_Intercept)
+out_all_sum_emax <- out_f_emax %>% group_by(RefIDExp) %>% 
+  mean_qi(b_emax_Intercept)
+out_all_sum_e50 <- out_all_e50 %>% group_by(RefIDExp) %>% 
+  mean_qi(b_e50_Intercept)
+out_all_sum_lambda <- out_f_lambda %>% group_by(RefIDExp) %>% 
+  mean_qi(b_lambda_Intercept)
+
+# Renaming beta values for all parameters and groupings
+e0_fit_sett <- out_all_sum_e0$b_e0_Intercept
+emax_fit_sett <- out_all_sum_emax$b_emax_Intercept
+e50_fit_sett <- out_all_sum_e50$b_e50_Intercept
+lambda_fit_sett <- out_all_sum_lambda$b_lambda_Intercept
+
+# Equation for average values of all parameters
+equ_average <- function(x){
+  e0_fit_sett[1] + emax_fit_sett * x^lambda_fit_sett / (e50_fit_sett[1]^lambda_fit_sett + x^lambda_fit_sett)
+}
+equ_average_b <- function(x){
+  e0_fit_sett[1] * (1 - emax_fit_sett*x^lambda_fit_sett/
+       (e50_fit_sett[1]^lambda_fit_sett + x^lambda_fit_sett))
+  }
+# Generic version of above
+equ_vector <- function(x){
+  e0_fit_sett * (1 - emax_fit_sett*x^lambda_fit_sett/
+       (e50_fit_sett^lambda_fit_sett + x^lambda_fit_sett))
+  }
+
+# Equations for group-level values of all parameters
+equ_group2 <- function(x){
+  e0_fit_sett[2] * (1 - emax_fit_sett*x^lambda_fit_sett/
+       (e50_fit_sett[2]^lambda_fit_sett + x^lambda_fit_sett))}
+equ_group3 <- function(x){
+  e0_fit_sett[3] * (1 - emax_fit_sett*x^lambda_fit_sett/
+       (e50_fit_sett[3]^lambda_fit_sett + x^lambda_fit_sett))}
+equ_group4 <- function(x){
+  e0_fit_sett[4] * (1 - emax_fit_sett*x^lambda_fit_sett/
+       (e50_fit_sett[4]^lambda_fit_sett + x^lambda_fit_sett))}
+equ_group5 <- function(x){
+  e0_fit_sett[5] * (1 - emax_fit_sett*x^lambda_fit_sett/
+       (e50_fit_sett[5]^lambda_fit_sett + x^lambda_fit_sett))}
+
+copper.larvsett2 = data.frame(x=c(0:10000))
+copper.larvsett2 = data.frame(x=c(0:10000),
+                    fxn_lo = sapply(copper.larvsett2$x, FUN = function(x){
+   mod_fixef[1,3]*(1 - mod_fixef[2,3] * x^mod_fixef[4,3]/
+       (mod_fixef[3,3]^mod_fixef[4,3] + x^mod_fixef[4,3]))
+}),
+                    fxn_up = sapply(copper.larvsett2$x, FUN = function(x){
+   mod_fixef[1,4]*(1 - mod_fixef[2,4] * x^mod_fixef[4,4]/
+       (mod_fixef[3,4]^mod_fixef[4,4] + x^mod_fixef[4,4]))
+}))
+
+## Bayesian model results plot
+plot_brm_copper.larvsett2 <- ggplot(data = copper.larvsett,
+       aes(x = level.converted.to.ug.L, y = StdResp100)) +
+  geom_point(col = "grey") +
+  geom_ribbon(data = copper.larvsett2, aes(x=x, ymin = fxn_lo, ymax = fxn_up), 
+              fill = "grey70", alpha = .4, 
+              show.legend=FALSE, inherit.aes=FALSE) +
+  geom_vline(xintercept=e50_fit_sett[1], linetype="dashed", color = "red") +
+  stat_function(fun = equ_group2, color = "gray50") +
+  stat_function(fun = equ_group3, color = "gray50") +
+  stat_function(fun = equ_group4, color = "gray50") +
+  stat_function(fun = equ_group5, color = "gray50") +
+  stat_function(fun = equ_average_b, size = 1) +
+  labs(x = "", y = "Larval\nsettlement (%)") +
+  scale_x_log10(limits = c(0.1,10000),
+                breaks=c(0.1,1,10,100,1000,10000,e50_fit_sett[1]), 
+                label=c("0.1","1","10","","1000","10,000",round(e50_fit_sett[1],digits=1))) +
+  scale_y_continuous(limits = c(0,100)) +
+  theme_classic()
+
+plot_brm_copper.larvsett2
+
+# EC50 Plot
+plot_EC50_copper.larvsett <- out_all_e50 %>%   
+  ggplot(aes(b_e50_Intercept, RefIDExp)) +
+  geom_density_ridges(
+    rel_min_height = 0.01, 
+    col = NA,
+    scale = 1) +
+  geom_pointintervalh(
+    data = out_all_sum_e50, size = 1) +
+  geom_text(
+    data = mutate_if(out_all_sum_e50, is.numeric, round, 1),
+    # Use glue package to combine strings
+    aes(label = glue::glue("{b_e50_Intercept} [{.lower}, {.upper}]"), x = Inf),
+    hjust = "inward") +
+  labs(x = expression(paste("E", C[50], " posterior distribution (", mu, "g/L Cu)")), 
+       y = "Experiment") +
+  scale_x_continuous(limits = c(0,160)) + 
+  theme_bw() + theme(panel.grid.major.y = element_blank())
+
+plot_EC50_copper.larvsett
+
+# E0 Plot
+plot_E0_copper.larvsett <- out_all_e0 %>%   
+  ggplot(aes(b_e0_Intercept, RefIDExp)) +
+  geom_density_ridges(
+    rel_min_height = 0.01, 
+    col = NA,
+    scale = 1) +
+  geom_pointintervalh(
+    data = out_all_sum_e0, size = 1) +
+  geom_text(
+    data = mutate_if(out_all_sum_e0, is.numeric, round, 1),
+    # Use glue package to combine strings
+    aes(label = glue::glue("{b_e0_Intercept} [{.lower}, {.upper}]"), x = Inf),
+    hjust = "inward") +
+  labs(x = expression(paste(E[0], " posterior distribution (% larvae survival)")), 
+       y = "Experiment") +
+  scale_x_continuous(limits = c(25,125)) + 
+  theme_bw() + theme(panel.grid.major.y = element_blank())
+
+plot_E0_copper.larvsett
+```  
+  
+#### c. ECx estimates
+
+```{r}
+Cu_larvsett <- fixef(fit_copper.larvsett)
+
+lambda <- Cu_larvsett[4,1]
+e50 <- Cu_larvsett[3,1]
+lambda_lo <- Cu_larvsett[4,3]
+e50_lo <- Cu_larvsett[3,3]
+lambda_up <- Cu_larvsett[4,4]
+e50_up <- Cu_larvsett[3,4]
+
+eci <- c(5,10,20,50)
+i <- 1 - eci/100
+Estimate <- e50 * ((1-i)/i)^(1/lambda)
+Q2.5 <- e50_lo * ((1-i)/i)^(1/lambda_lo)
+Q97.5 <- e50_up * ((1-i)/i)^(1/lambda_up)
+
+Age_class <- c("LARVAE", "LARVAE", "LARVAE", "LARVAE")
+Response <- c("Settlement rate","Settlement rate",
+              "Settlement rate","Settlement rate")
+Pollutant <- c("Copper", "", "", "")
+ECx <- c('EC5', 'EC10', 'EC20', 'EC50')
+Cu_larvsett_df <- data.frame(cbind(Age_class, Response, Pollutant, 
+                               ECx, Estimate, Q2.5, Q97.5))
+Cu_larvsett_df <- Cu_larvsett_df %>% #converting appropriate columns to numeric...
+  mutate_at(vars(Estimate, Q2.5, Q97.5), as.character) %>% 
+  mutate_at(vars(Estimate, Q2.5, Q97.5), as.numeric) %>% 
+  mutate_if(is.numeric, round, digits=1)
+kbl(Cu_larvsett_df, align = "l", 
+    col.names = c("Coral age class", "Coral response", "Pollutant", 
+                  "ECx", "Estimate", "Q2.5", "Q97.5")) %>%
+  kable_paper(full_width = F) %>%
+  column_spec(1, bold = T) %>%
+  collapse_rows(columns = 1:2, valign = "top")
+```
+    
+
+### 4. brms with Copper - adult maximum quantum yield
+  
+Let's plot the raw data to assess whether the non-linear, Emax model parameterization would be appropriate...
+  
+```{r, echo=FALSE, warning=FALSE}
+# COPPER concentration vs. FV/FM
+copper.fvfm.conc <- ggplot(copper.fvfm, 
+                           aes(x = level.converted.to.ug.L,
+                               y = Standardized.response.level,
+                               color = RefIDExp,
+                               ymin = Standardized.response.level-Standardized.SE,
+                               ymax = Standardized.response.level+Standardized.SE)) + 
+  geom_pointrange() +
+  ggtitle("Copper - Quantum Yield") +
+  labs(x = "Copper concentration (ug/L)",
+       y = "Maximum quantum yield (Fv/Fm)",
+       color = "Experiment") +
+  theme_classic() + scale_x_log10()
+
+copper.fvfm.conc + geom_smooth(method = lm, se = FALSE) #linear fit
+copper.fvfm.conc + geom_smooth(method = loess, se = FALSE) #smooth (non-linear) fit
+copper.fvfm.conc
+ggplotly(copper.fvfm.conc) #so that I can isolate particular experiments
+```
+  
+Now let's use brms to model the dose-response relationship between copper and max quantum yield.
+
+```{r, echo=FALSE}
+#EC50 GROUPED BY STUDY
+fit_copper.fvfm <- brm(
+  bf(Standardized.response.level | se(Standardized.SE, sigma = TRUE) ~ 
+       e0 * (1 - emax*level.converted.to.ug.L^lambda /
+       (e50^lambda+level.converted.to.ug.L^lambda)), 
+     e0 ~ 1, emax ~ 1, e50 ~ 1 + (1|RefIDExp), lambda ~ 1,
+     nl = TRUE),
+  data = copper.fvfm,
+  family = gaussian(),
+  prior = c(
+    prior(normal(0.6,0.10), nlpar = "e0", lb = 0, ub = 1.00),
+    prior(normal(0.5,0.2), nlpar = "emax", lb = 0, ub = 1),
+    prior(normal(350, 25), nlpar = "e50", lb = 0, ub = 500),
+    prior(normal(0, 10), nlpar = "lambda", lb = 0)
+  ), cores = 4, chains = 4, iter = 2000, warmup = 1000, seed = 2742019)
+```
+  
+#### a. Bayesian model summary
+  
+```{r, echo=FALSE}
+#EC50 GROUPED BY STUDY
+summary(fit_copper.fvfm) #No errors
+#EC50 is 365.3
+posterior_summary(fit_copper.fvfm)
+bayes_R2(fit_copper.fvfm) #Bayesian R-squared = 0.715
+#plot(fit_copper.fvfm) #need to hit Enter in Console
+```
+  
+#### b. Plots of Bayesian model results and EC50 posterior distributions by article
+  
+```{r, echo=FALSE, warning=FALSE}
+#Random-effects structure
+#e0 ~ 1, emax ~ 1, e50 ~ 1 + (1|RefIDExp), lambda ~ 1
+
+# Assign model of choice:
+mod <- fit_copper.fvfm
+mod_fixef <- fixef(mod)
+
+# Group-specific effects are deviations + average
+out_r_e50 <- mod %>% 
+  spread_draws(r_RefIDExp__e50[RefIDExp,term], b_e50_Intercept) %>% 
+  mutate(b_e50_Intercept = r_RefIDExp__e50 + b_e50_Intercept) 
+
+# Average effects
+out_f_e0 <- mod %>% 
+  spread_draws(b_e0_Intercept) %>% 
+  mutate(RefIDExp = "Average") %>% ungroup()
+out_f_emax <- mod %>% 
+  spread_draws(b_emax_Intercept) %>% 
+  mutate(RefIDExp = "Average") %>% ungroup()
+out_f_e50 <- mod %>% 
+  spread_draws(b_e50_Intercept) %>% 
+  mutate(RefIDExp = "Average")
+out_f_lambda <- mod %>% 
+  spread_draws(b_lambda_Intercept) %>% 
+  mutate(RefIDExp = "Average") %>% ungroup()
+
+# Combine average and study-specific effects' data frames
+out_all_e50 <- bind_rows(out_r_e50, out_f_e50) %>% 
+  ungroup() %>%
+  mutate(RefIDExp = fct_relevel(RefIDExp, "Average"))
+
+# Data frames of summary numbers
+out_all_sum_e0 <- out_f_e0 %>% group_by(RefIDExp) %>% 
+  mean_qi(b_e0_Intercept)
+out_all_sum_emax <- out_f_emax %>% group_by(RefIDExp) %>% 
+  mean_qi(b_emax_Intercept)
+out_all_sum_e50 <- out_all_e50 %>% group_by(RefIDExp) %>% 
+  mean_qi(b_e50_Intercept)
+out_all_sum_lambda <- out_f_lambda %>% group_by(RefIDExp) %>% 
+  mean_qi(b_lambda_Intercept)
+
+# Renaming beta values for all parameters and groupings
+e0_fit_Cufvfm <- out_all_sum_e0$b_e0_Intercept
+emax_fit_Cufvfm <- out_all_sum_emax$b_emax_Intercept
+e50_fit_Cufvfm <- out_all_sum_e50$b_e50_Intercept
+lambda_fit_Cufvfm <- out_all_sum_lambda$b_lambda_Intercept
+
+# Equation for average values of all parameters
+equ_average <- function(x){
+  e0_fit_Cufvfm * (1 - emax_fit_Cufvfm*x^lambda_fit_Cufvfm/
+        (e50_fit_Cufvfm[1]^lambda_fit_Cufvfm + x^lambda_fit_Cufvfm))
+  }
+# Generic version of above
+equ_vector <- function(x){
+  e0_fit_Cufvfm * (1 - emax_fit_Cufvfm*x^lambda_fit_Cufvfm/
+       (e50_fit_Cufvfm^lambda_fit_Cufvfm + x^lambda_fit_Cufvfm))
+}
+
+# Equations for group-level values of all parameters
+equ_group2 <- function(x){
+  e0_fit_Cufvfm * (1 - emax_fit_Cufvfm*x^lambda_fit_Cufvfm/
+        (e50_fit_Cufvfm[2]^lambda_fit_Cufvfm + x^lambda_fit_Cufvfm))}
+equ_group3 <- function(x){
+  e0_fit_Cufvfm * (1 - emax_fit_Cufvfm*x^lambda_fit_Cufvfm/
+        (e50_fit_Cufvfm[3]^lambda_fit_Cufvfm + x^lambda_fit_Cufvfm))}
+equ_group4 <- function(x){
+  e0_fit_Cufvfm * (1 - emax_fit_Cufvfm*x^lambda_fit_Cufvfm/
+        (e50_fit_Cufvfm[4]^lambda_fit_Cufvfm + x^lambda_fit_Cufvfm))}
+equ_group5 <- function(x){
+  e0_fit_Cufvfm * (1 - emax_fit_Cufvfm*x^lambda_fit_Cufvfm/
+        (e50_fit_Cufvfm[5]^lambda_fit_Cufvfm + x^lambda_fit_Cufvfm))}
+equ_group6 <- function(x){
+  e0_fit_Cufvfm * (1 - emax_fit_Cufvfm*x^lambda_fit_Cufvfm/
+        (e50_fit_Cufvfm[6]^lambda_fit_Cufvfm + x^lambda_fit_Cufvfm))}
+equ_group7 <- function(x){
+  e0_fit_Cufvfm * (1 - emax_fit_Cufvfm*x^lambda_fit_Cufvfm/
+        (e50_fit_Cufvfm[7]^lambda_fit_Cufvfm + x^lambda_fit_Cufvfm))}
+equ_group8 <- function(x){
+  e0_fit_Cufvfm * (1 - emax_fit_Cufvfm*x^lambda_fit_Cufvfm/
+        (e50_fit_Cufvfm[8]^lambda_fit_Cufvfm + x^lambda_fit_Cufvfm))}
+equ_group9 <- function(x){
+  e0_fit_Cufvfm * (1 - emax_fit_Cufvfm*x^lambda_fit_Cufvfm/
+        (e50_fit_Cufvfm[9]^lambda_fit_Cufvfm + x^lambda_fit_Cufvfm))}
+equ_group10 <- function(x){
+  e0_fit_Cufvfm * (1 - emax_fit_Cufvfm*x^lambda_fit_Cufvfm/
+        (e50_fit_Cufvfm[10]^lambda_fit_Cufvfm + x^lambda_fit_Cufvfm))}
+equ_group11 <- function(x){
+  e0_fit_Cufvfm * (1 - emax_fit_Cufvfm*x^lambda_fit_Cufvfm/
+        (e50_fit_Cufvfm[11]^lambda_fit_Cufvfm + x^lambda_fit_Cufvfm))}
+equ_group12 <- function(x){
+  e0_fit_Cufvfm * (1 - emax_fit_Cufvfm*x^lambda_fit_Cufvfm/
+        (e50_fit_Cufvfm[12]^lambda_fit_Cufvfm + x^lambda_fit_Cufvfm))}
+
+copper.fvfm2 = data.frame(x=c(0:10000))
+copper.fvfm2 = data.frame(x=c(0:10000),
+                    fxn_lo = sapply(copper.fvfm2$x, FUN = function(x){
+  mod_fixef[1,3]*(1 - mod_fixef[2,3] * x^mod_fixef[4,3]/
+       (mod_fixef[3,3]^mod_fixef[4,3] + x^mod_fixef[4,3]))
+}),
+                    fxn_up = sapply(copper.fvfm2$x, FUN = function(x){
+  mod_fixef[1,4]*(1 - mod_fixef[2,4] * x^mod_fixef[4,4]/
+       (mod_fixef[3,4]^mod_fixef[4,4] + x^mod_fixef[4,4]))
+}))
+
+## Bayesian model results plot
+plot_brm_copper.fvfm2 <- ggplot(data = copper.fvfm,
+       aes(x = level.converted.to.ug.L, y = Standardized.response.level)) +
+  geom_point(col = "grey") +
+  geom_ribbon(data = copper.fvfm2, aes(x=x, ymin = fxn_lo, ymax = fxn_up), 
+              fill = "grey70", alpha = .4, 
+              show.legend=FALSE, inherit.aes=FALSE) +
+  geom_vline(xintercept=e50_fit_Cufvfm[1], linetype="dashed", color = "red") +
+  stat_function(fun = equ_group2, color = "gray50") +
+  stat_function(fun = equ_group3, color = "gray50") +
+  stat_function(fun = equ_group4, color = "gray50") +
+  stat_function(fun = equ_group5, color = "gray50") +
+  stat_function(fun = equ_group6, color = "gray50") +
+  stat_function(fun = equ_group7, color = "gray50") +
+  stat_function(fun = equ_group8, color = "gray50") +
+  stat_function(fun = equ_group9, color = "gray50") +
+  stat_function(fun = equ_group10, color = "gray50") +
+  stat_function(fun = equ_group11, color = "gray50") +
+  stat_function(fun = equ_group12, color = "gray50") +
+  stat_function(fun = equ_average, size = 1) +
+  labs(x = "", y = expression("MQY (F"["v"]*" / F"["m"]*")")) +
+  scale_x_log10(limits = c(1,1000), breaks=c(1,10,100,1000,e50_fit_Cufvfm[1]), 
+                label=c("1","10","100","1000",round(e50_fit_Cufvfm[1],digits=1))) +
+  scale_y_continuous(limits = c(0, 0.8)) +
+  theme_classic()
+
+plot_brm_copper.fvfm2
+
+## EC50 Plot
+plot_EC50_copper.fvfm <- out_all_e50 %>%   
+  ggplot(aes(b_e50_Intercept, RefIDExp)) +
+  geom_density_ridges(
+    rel_min_height = 0.01, 
+    col = NA,
+    scale = 1) +
+  geom_pointintervalh(
+    data = out_all_sum_e50, size = 1) +
+  geom_text(
+    data = mutate_if(out_all_sum_e50, is.numeric, round, 1),
+    # Use glue package to combine strings
+    aes(label = glue::glue("{b_e50_Intercept} [{.lower}, {.upper}]"), x = Inf),
+    hjust = "inward") +
+  labs(x = expression(paste("E", C[50], " posterior distribution (", mu, "g/L Cu)")), 
+       y = "Article") +
+  scale_x_continuous(limits = c(290,500)) + 
+  theme_bw() + theme(panel.grid.major.y = element_blank())
+
+plot_EC50_copper.fvfm
+```  
+  
+#### c. ECx estimates
+
+```{r}
+Cu_fvfm <- fixef(fit_copper.fvfm)
+
+lambda <- Cu_fvfm[4,1]
+e50 <- Cu_fvfm[3,1]
+lambda_lo <- Cu_fvfm[4,3]
+e50_lo <- Cu_fvfm[3,3]
+lambda_up <- Cu_fvfm[4,4]
+e50_up <- Cu_fvfm[3,4]
+
+eci <- c(5,10,20,50)
+i <- 1 - eci/100
+Estimate <- e50 * ((1-i)/i)^(1/lambda)
+Q2.5 <- e50_lo * ((1-i)/i)^(1/lambda_lo)
+Q97.5 <- e50_up * ((1-i)/i)^(1/lambda_up)
+
+Age_class <- c("ADULTS", "ADULTS", "ADULTS", "ADULTS")
+Response <- c("Photosynthetic efficiency (MQY)","Photosynthetic efficiency (MQY)",
+              "Photosynthetic efficiency (MQY)","Photosynthetic efficiency (MQY)")
+Pollutant <- c("Copper", "", "", "")
+ECx <- c('EC5', 'EC10', 'EC20', 'EC50')
+Cu_fvfm_df <- data.frame(cbind(Age_class, Response, Pollutant, 
+                               ECx, Estimate, Q2.5, Q97.5))
+Cu_fvfm_df <- Cu_fvfm_df %>% #converting appropriate columns to numeric...
+  mutate_at(vars(Estimate, Q2.5, Q97.5), as.character) %>% 
+  mutate_at(vars(Estimate, Q2.5, Q97.5), as.numeric) %>% 
+  mutate_if(is.numeric, round, digits=1)
+kbl(Cu_fvfm_df, align = "l", 
+    col.names = c("Coral age class", "Coral response", "Pollutant", 
+                  "ECx", "Estimate", "Q2.5", "Q97.5")) %>%
+  kable_paper(full_width = F) %>%
+  column_spec(1, bold = T) %>%
+  collapse_rows(columns = 1:2, valign = "top")
+```
+    
+  
+### 5. brms with Diuron - adult maximum quantum yield
+  
+Let's plot the raw data to assess whether the non-linear, Emax model parameterization would be appropriate...
+  
+```{r, echo=FALSE, warning=FALSE}
+# DIURON concentration vs. FV/FM
+diuron.fvfm.conc <- ggplot(diuron.fvfm, 
+                           aes(x = level.converted.to.ug.L,
+                               y = Standardized.response.level,
+                               color = RefIDExp,
+                               ymin = Standardized.response.level-Standardized.SE,
+                               ymax = Standardized.response.level+Standardized.SE)) + 
+  scale_y_continuous(limits = c(0, 1)) +
+  geom_pointrange() +
+  ggtitle("Diuron - Quantum Yield") +
+  labs(x = "Diuron concentration (ug/L)",
+       y = "Maximum quantum yield (Fv/Fm)",
+       color = "Experiment") +
+  theme_classic() + scale_x_log10()
+
+# looking at cumulative exposure (concentration x duration of exposure) because duration of exposure is what separates many studies/experiments in Cu25:
+# DIURON cumulative exposure vs. FV/FM
+diuron.fvfm.cumexp <- ggplot(diuron.fvfm, 
+                           aes(x = CumExp,
+                               y = Standardized.response.level,
+                               color = RefIDExp,
+                               ymin = Standardized.response.level-Standardized.SE,
+                               ymax = Standardized.response.level+Standardized.SE)) + 
+  scale_y_continuous(limits = c(0, 1)) +
+  geom_pointrange() +
+  ggtitle("Diuron - Quantum Yield") +
+  labs(x = "Diuron cumulative exposure (ug x day/L)",
+       y = "Maximum quantum yield (Fv/Fm)",
+       color = "Experiment") +
+  theme_classic() + scale_x_log10()
+
+diuron.fvfm.conc + geom_smooth(method = lm, se = FALSE) #linear fit
+diuron.fvfm.conc + geom_smooth(method = loess, se = FALSE) #smooth (non-linear) fit
+diuron.fvfm.conc
+ggplotly(diuron.fvfm.conc) #so that I can isolate particular experiments
+
+diuron.fvfm.cumexp + geom_smooth(method = lm, se = FALSE) #linear fit
+diuron.fvfm.cumexp + geom_smooth(method = loess, se = FALSE) #smooth (non-linear) fit
+diuron.fvfm.cumexp
+ggplotly(diuron.fvfm.cumexp)
+
+diuron.fvfm_noDiu02 <- diuron.fvfm %>% filter(!RefID == "Diu02") #removing experiment with very long term exposure
+#diuron.fvfm_noDiu02 %>% count(RefID) #n=5
+#diuron.fvfm_noDiu02 %>% count(RefIDExp) #n=25
+#diuron.fvfm_noDiu02 %>% count(Gsp) #n=5 species, 5 genera
+
+diuron.fvfm_0_1_10 <- diuron.fvfm %>% filter(level.converted.to.ug.L == 0 | level.converted.to.ug.L == 1 | level.converted.to.ug.L == 10)
+diuron.fvfm_0_1_10 <- diuron.fvfm_0_1_10 %>% 
+  mutate(log_duration = log10(exposure.duration.in.days)) %>% 
+  mutate(factor_ug_L = as.factor(level.converted.to.ug.L)) %>% 
+  mutate(factor_ug_L_0 = ifelse(factor_ug_L=="0",1,0)) %>% 
+  mutate(factor_ug_L_1 = ifelse(factor_ug_L=="1",1,0)) %>% 
+  mutate(factor_ug_L_10 = ifelse(factor_ug_L=="10",1,0))
+
+diuron.fvfm_plot <- ggplot(diuron.fvfm_0_1_10, 
+                           aes(x = exposure.duration.in.days,
+                               y = Standardized.response.level,
+                               ymin = Standardized.response.level-Standardized.SE,
+                               ymax = Standardized.response.level+Standardized.SE)) + 
+  geom_pointrange(size = 0.25) +
+  labs(x = "Diuron exposure duration (days)",
+       y = expression("MQY (F"["v"]*" / F"["m"]*")")) +
+  scale_y_continuous(limits = c(0, 0.8)) +
+  scale_x_log10() + theme_light()  + 
+  facet_wrap(~ level.converted.to.ug.L, 
+             labeller = label_bquote(cols = .(level.converted.to.ug.L)~mu*'g/L'))
+
+diuron.fvfm_plot + geom_smooth(method = lm)
+```
+  
+We should conduct a multiple linear regression of max. quantum yield as a function of exposure duration (continuous variable) and concentration at three levels: 0, 1, and 10 ug/L (categorical variable).
+  
+```{r, echo=FALSE}
+#equal slopes and intercepts (simple linear regression)
+lm_diuron.fvfm1 <- lm(Standardized.response.level ~ log_duration,
+                      data = diuron.fvfm_0_1_10)
+#equal slopes and different intercepts model
+lm_diuron.fvfm2 <- lm(Standardized.response.level ~ log_duration+factor_ug_L,
+                      data = diuron.fvfm_0_1_10)
+#different slopes and intercepts model
+lm_diuron.fvfm3 <- lm(Standardized.response.level ~ log_duration*factor_ug_L,
+                      data = diuron.fvfm_0_1_10)
+#different slopes and partially different intercepts model
+lm_diuron.fvfm4 <- lm(Standardized.response.level ~ 
+                        log_duration + factor_ug_L + 
+                        log_duration:factor_ug_L_10,
+                      data = diuron.fvfm_0_1_10)
+
+
+anova(lm_diuron.fvfm1, lm_diuron.fvfm2, lm_diuron.fvfm3, lm_diuron.fvfm4)
+#Model 2 is favored
+summary(lm_diuron.fvfm2)
+#there is an effect of duration and evidence that the intercept for 10ug/L data is different from that of 0 ug/L data (no evidence of difference bw 0 and 1 ug/L subsets)
+lm_coef <- coef(lm_diuron.fvfm2)
+lm_CI <- confint(lm_diuron.fvfm2)[,1]
+lm_est <- cbind(lm_coef, lm_CI)
+lm_0_int <- lm_est[1,1]
+lm_1_int <- lm_est[1,1]+lm_est[3,1]
+lm_10_int <- lm_est[1,1]+lm_est[4,1]
+lm_m <- lm_est[2,1]
+
+abline_df <- data.frame(conc = as.character(levels(diuron.fvfm_0_1_10$factor_ug_L)),
+                        b = c(lm_0_int, lm_1_int, lm_10_int),
+                        m = c(lm_m, lm_m, lm_m))
+diuron.fvfm_plot + 
+  geom_abline(data = abline_df, aes(slope = m, intercept = b),
+              linetype = "dashed", colour = "red4")
+#all three lines from the model are shown but can't separate them by facet -- geom_abline() and facet_grid() appear to be incompatible
+```
+  
+The effect of diuron exposure duration on MQY was slight but significant: a ten-fold increase in duration was associated with a decline in mean MQY of 0.03 (95% CI 0.01, 0.06; MLR p = 0.019). Diuron exposure concentrations of 10 ug/L led to a decline in mean MQY of 0.14 (95% CI 0.11, 0.17; MLR p < 0.001) as compared to the control (0 ug/L). After accounting for the effects of exposure duration, there was no evidence that concentrations of 1 ug/L led to additional declines in mean MQY (MLR p = 0.326).
+  
+Now let's use brms to model the dose-response relationship between diuron concentration and max quantum yield.
+
+```{r, echo=FALSE}
+#diuron.fvfm_noDiu02 %>% count(Gsp)
+
+##CONCENTRATION AS PREDICTOR, DATASET WITHOUT DIU02 (LONG, >1WK EXPOSURE)
+#EC50 GROUPED BY STUDY NESTED WITHIN ARTICLE
+fit_diuron.fvfm <- brm(
+  bf(Standardized.response.level | se(Standardized.SE, sigma = TRUE) ~ 
+       e0 * (1 - emax*level.converted.to.ug.L^lambda /
+       (e50^lambda+level.converted.to.ug.L^lambda)),  
+     e0 ~ 1, emax ~ 1, e50 ~ 1 + (1|RefID/RefIDExp), lambda ~ 1,
+     nl = TRUE),
+  data = diuron.fvfm_noDiu02,
+  family = gaussian(),
+  prior = c(
+    prior(normal(0.7,0.10), nlpar = "e0", lb = 0, ub = 1.00),
+    prior(normal(0.5,0.2), nlpar = "emax", lb = 0, ub = 1),
+    prior(normal(50, 20), nlpar = "e50", lb = 0, ub = 1000),
+    prior(normal(0, 10), nlpar = "lambda", lb = 0)
+  ), control = list(adapt_delta = 0.999999, max_treedepth = 20),
+  cores = 4, chains = 4, iter = 4000, warmup = 1000, seed = 19012018)
+```
+
+#### a. Bayesian model summary
+  
+```{r, echo=FALSE}
+#EC50 GROUPED BY STUDY NESTED WITHIN ARTICLE
+summary(fit_diuron.fvfm) #There were NO divergent transitions after warmup
+#EC50 is 43.8
+posterior_summary(fit_diuron.fvfm)
+bayes_R2(fit_diuron.fvfm) #Bayesian R-squared = 0.853
+#plot(fit_diuron.fvfm) #need to hit Enter in Console
+#launch_shinystan(fit_diuron.fvfm) #will launch web-based tool -- usable only when Console is executing this command, so will need to STOP when you want to continue in R
+```
+  
+#### b. Plots of Bayesian model results and EC50 posterior distributions by article
+  
+```{r, echo=FALSE, warning=FALSE}
+#Random-effects structure
+#e0 ~ 1, emax ~ 1, e50 ~ 1 + (1|RefID/RefIDExp), lambda ~ 1
+
+# Assign model of choice:
+mod <- fit_diuron.fvfm
+mod_fixef <- fixef(mod)
+
+# Group-specific effects are deviations + average
+out_r_e50 <- mod %>% 
+  spread_draws(r_RefID__e50[RefID,term], b_e50_Intercept) %>% 
+  mutate(b_e50_Intercept = r_RefID__e50 + b_e50_Intercept) 
+
+# Average effects
+out_f_e0 <- mod %>% 
+  spread_draws(b_e0_Intercept) %>% 
+  mutate(RefID = "Average") %>% ungroup()
+out_f_emax <- mod %>% 
+  spread_draws(b_emax_Intercept) %>% 
+  mutate(RefID = "Average") %>% ungroup()
+out_f_e50 <- mod %>% 
+  spread_draws(b_e50_Intercept) %>% 
+  mutate(RefID = "Average")
+out_f_lambda <- mod %>% 
+  spread_draws(b_lambda_Intercept) %>% 
+  mutate(RefID = "Average") %>% ungroup()
+
+# Combine average and study-specific effects' data frames
+out_all_e50 <- bind_rows(out_r_e50, out_f_e50) %>% 
+  ungroup() %>%
+  mutate(RefID = fct_relevel(RefID, "Average"))
+
+# Data frames of summary numbers
+out_all_sum_e0 <- out_f_e0 %>% group_by(RefID) %>% 
+  mean_qi(b_e0_Intercept)
+out_all_sum_emax <- out_f_emax %>% group_by(RefID) %>% 
+  mean_qi(b_emax_Intercept)
+out_all_sum_e50 <- out_all_e50 %>% group_by(RefID) %>% 
+  mean_qi(b_e50_Intercept)
+out_all_sum_lambda <- out_f_lambda %>% group_by(RefID) %>% 
+  mean_qi(b_lambda_Intercept)
+
+# Renaming beta values for all parameters and groupings
+e0_fit_Difvfm <- out_all_sum_e0$b_e0_Intercept
+emax_fit_Difvfm <- out_all_sum_emax$b_emax_Intercept
+e50_fit_Difvfm <- out_all_sum_e50$b_e50_Intercept
+lambda_fit_Difvfm <- out_all_sum_lambda$b_lambda_Intercept
+
+# Equation for average values of all parameters
+equ_average <- function(x){
+  e0_fit_Difvfm * (1 - emax_fit_Difvfm*x^lambda_fit_Difvfm/
+        (e50_fit_Difvfm[1]^lambda_fit_Difvfm + x^lambda_fit_Difvfm))
+  }
+# Generic version of above
+equ_vector <- function(x){
+  e0_fit_Difvfm * (1 - emax_fit_Difvfm*x^lambda_fit_Difvfm/
+       (e50_fit_Difvfm^lambda_fit_Difvfm + x^lambda_fit_Difvfm))
+}
+
+# Equations for group-level values of all parameters
+equ_group2 <- function(x){
+  e0_fit_Difvfm * (1 - emax_fit_Difvfm*x^lambda_fit_Difvfm/
+        (e50_fit_Difvfm[2]^lambda_fit_Difvfm + x^lambda_fit_Difvfm))}
+equ_group3 <- function(x){
+  e0_fit_Difvfm * (1 - emax_fit_Difvfm*x^lambda_fit_Difvfm/
+        (e50_fit_Difvfm[3]^lambda_fit_Difvfm + x^lambda_fit_Difvfm))}
+equ_group4 <- function(x){
+  e0_fit_Difvfm * (1 - emax_fit_Difvfm*x^lambda_fit_Difvfm/
+        (e50_fit_Difvfm[4]^lambda_fit_Difvfm + x^lambda_fit_Difvfm))}
+equ_group5 <- function(x){
+  e0_fit_Difvfm * (1 - emax_fit_Difvfm*x^lambda_fit_Difvfm/
+        (e50_fit_Difvfm[5]^lambda_fit_Difvfm + x^lambda_fit_Difvfm))}
+equ_group6 <- function(x){
+  e0_fit_Difvfm * (1 - emax_fit_Difvfm*x^lambda_fit_Difvfm/
+        (e50_fit_Difvfm[6]^lambda_fit_Difvfm + x^lambda_fit_Difvfm))}
+
+diuron.fvfm2 = data.frame(x=c(0:10000))
+diuron.fvfm2 = data.frame(x=c(0:10000),
+                    fxn_lo = sapply(diuron.fvfm2$x, FUN = function(x){
+  mod_fixef[1,3]*(1 - mod_fixef[2,3] * x^mod_fixef[4,3]/
+       (mod_fixef[3,3]^mod_fixef[4,3] + x^mod_fixef[4,3]))
+}),
+                    fxn_up = sapply(diuron.fvfm2$x, FUN = function(x){
+  mod_fixef[1,4]*(1 - mod_fixef[2,4] * x^mod_fixef[4,4]/
+       (mod_fixef[3,4]^mod_fixef[4,4] + x^mod_fixef[4,4]))
+}))
+
+## Bayesian model results plot
+plot_brm_diuron.fvfm2 <- ggplot(data = diuron.fvfm,
+       aes(x = level.converted.to.ug.L, y = Standardized.response.level)) +
+  geom_point(col = "grey") +
+  geom_ribbon(data = diuron.fvfm2, aes(x=x, ymin = fxn_lo, ymax = fxn_up), 
+              fill = "grey70", alpha = .4, 
+              show.legend=FALSE, inherit.aes=FALSE) +
+  geom_vline(xintercept=e50_fit_Difvfm[1], linetype="dashed", color = "red") +
+  stat_function(fun = equ_group2, color = "gray50") +
+  stat_function(fun = equ_group3, color = "gray50") +
+  stat_function(fun = equ_group4, color = "gray50") +
+  stat_function(fun = equ_group5, color = "gray50") +
+  stat_function(fun = equ_group6, color = "gray50") +
+  stat_function(fun = equ_average, size = 1) +
+  labs(x = expression("Diuron exposure concentration ("*mu*"g/L)"), 
+       y = expression("MQY (F"["v"]*" / F"["m"]*")")) +
+  scale_x_log10(limits = c(0.1,1000), 
+                breaks=c(0.1, 1,10,100,1000,e50_fit_Difvfm[1]), 
+                label=c("0.1","1","10","","1000",round(e50_fit_Difvfm[1],digits=1))) +
+  scale_y_continuous(limits = c(0, 0.8)) +
+  theme_classic()
+
+plot_brm_diuron.fvfm2
+
+## EC50 Plot
+plot_EC50_diuron.fvfm <- out_all_e50 %>%   
+  ggplot(aes(b_e50_Intercept, RefID)) +
+  geom_density_ridges(
+    rel_min_height = 0.01, 
+    col = NA,
+    scale = 1) +
+  geom_pointintervalh(
+    data = out_all_sum_e50, size = 1) +
+  geom_text(
+    data = mutate_if(out_all_sum_e50, is.numeric, round, 1),
+    # Use glue package to combine strings
+    aes(label = glue::glue("{b_e50_Intercept} [{.lower}, {.upper}]"), x = Inf),
+    hjust = "inward") +
+  labs(x = expression(paste("E", C[50], " posterior distribution (", mu, "g/L Diuron)")), 
+       y = "Article") +
+  scale_x_continuous(limits = c(0,150)) + 
+  theme_bw() + theme(panel.grid.major.y = element_blank())
+
+plot_EC50_diuron.fvfm
+```  
+  
+#### c. ECx estimates
+
+```{r}
+Di_fvfm <- fixef(fit_diuron.fvfm)
+
+lambda <- Di_fvfm[4,1]
+e50 <- Di_fvfm[3,1]
+lambda_lo <- Di_fvfm[4,3]
+e50_lo <- Di_fvfm[3,3]
+lambda_up <- Di_fvfm[4,4]
+e50_up <- Di_fvfm[3,4]
+
+eci <- c(5,10,20,50)
+i <- 1 - eci/100
+Estimate <- e50 * ((1-i)/i)^(1/lambda)
+Q2.5 <- e50_lo * ((1-i)/i)^(1/lambda_lo)
+Q97.5 <- e50_up * ((1-i)/i)^(1/lambda_up)
+
+Age_class <- c("ADULTS", "ADULTS", "ADULTS", "ADULTS")
+Response <- c("Photosynthetic efficiency (MQY)","Photosynthetic efficiency (MQY)",
+              "Photosynthetic efficiency (MQY)","Photosynthetic efficiency (MQY)")
+Pollutant <- c("Diuron", "", "", "")
+ECx <- c('EC5', 'EC10', 'EC20', 'EC50')
+Di_fvfm_df <- data.frame(cbind(Age_class, Response, Pollutant, 
+                               ECx, Estimate, Q2.5, Q97.5))
+Di_fvfm_df <- Di_fvfm_df %>% #converting appropriate columns to numeric...
+  mutate_at(vars(Estimate, Q2.5, Q97.5), as.character) %>% 
+  mutate_at(vars(Estimate, Q2.5, Q97.5), as.numeric) %>% 
+  mutate_if(is.numeric, round, digits=1)
+kbl(Di_fvfm_df, align = "l", 
+    col.names = c("Coral age class", "Coral response", "Pollutant", 
+                  "ECx", "Estimate", "Q2.5", "Q97.5")) %>%
+  kable_paper(full_width = F) %>%
+  column_spec(1, bold = T) %>%
+  collapse_rows(columns = 1:2, valign = "top")
+```
+  
+  
+### 6. brms with Metal - gamete fertilization success
+  
+Let's plot the raw data to assess whether the non-linear, Emax model parameterization would be appropriate...
+  
+```{r, echo=FALSE, warning=FALSE}
+# metal MASS concentration (ug/L) vs. fertilization success
+metal.fert.conc <- ggplot(metal.fert, 
+                          aes(x = level.converted.to.ug.L,
+                              y = Standardized.response.level,
+                              color = Pollutant,
+                              ymin = Standardized.response.level-Standardized.SE,
+                              ymax = Standardized.response.level+Standardized.SE)) + 
+  geom_pointrange() +
+  ggtitle("Metals - Fertilization success rate vs. mass concentration") +
+  labs(x = "Metal mass concentration (ug/L)",
+       y = "Fertilization success (%)",
+       color = "Pollutant") +
+  theme_classic() + 
+  scale_x_log10(limits = c(0.1,100000), 
+                breaks=c(0.1,1,10,100,1000,10000,100000), 
+                label=c("0.1","1","10","100","1000","10000","100000"))
+
+metal.fert.conc + geom_smooth(method = lm, se = FALSE) #linear fit
+metal.fert.conc
+ggplotly(metal.fert.conc)
+#of metals, manganese and cobalt are only ones that may not fit the Emax model parameterization
+metal.fert2 <- metal.fert %>% 
+  filter(!Pollutant == "Manganese" & !Pollutant == "Cobalt")
+metal.fert2 %>% count(Pollutant)
+  
+# metal MOLAR concentration (umol/L) vs. fertilization success
+metal.fert.conc2 <- ggplot(metal.fert, 
+                           aes(x = level.umol.L,
+                               y = Standardized.response.level,
+                               color = Pollutant,
+                               ymin = Standardized.response.level-Standardized.SE,
+                               ymax = Standardized.response.level+Standardized.SE)) + 
+  geom_pointrange() +
+  ggtitle("Metals - Fertilization success rate vs. molar concentration") +
+  labs(x = "Metal molar concentration (umol/L)",
+       y = "Fertilization success (%)",
+       color = "Pollutant") +
+  theme_classic() + 
+  scale_x_log10(limits = c(0.001,10000), 
+                breaks=c(0.001,0.01,0.1,1,10,100,1000,10000), 
+                label=c("0.001","0.01","0.1","1","10","100","1000","10000"))
+
+metal.fert.conc2 + geom_smooth(method = lm, se = FALSE) #linear fit
+metal.fert.conc2
+ggplotly(metal.fert.conc2)
+#of metals, manganese and cobalt are only ones that may not fit the Emax model parameterization
+```
+
+Now let's use brms to model the dose-response relationship between different metals' effects on fertilization:
+
+```{r, echo=FALSE}
+## setting max fert level to 100 for the two cases in which data extracted from figures were above 100
+max(metal.fert2$Standardized.response.level)
+metal.fert2$StdResp100 <- metal.fert2$Standardized.response.level
+metal.fert2$StdResp100[metal.fert2$StdResp100>100] = 100
+max(metal.fert2$StdResp100)
+
+# X = MOLAR-CONCENTRATION (UMOL/L)
+#note that all analyses are conducted with log10_1_umol_L (=log10(x+1)) instead of umol/L
+
+#EC50 GROUPED BY STUDY (NESTED WITHIN ARTICLE) AND METAL TYPE, ORTHOGONALLY
+#E0, EMAX, LAMBDA GROUPED BY METAL TYPE
+fit_metal.fert <- brm(
+  bf(StdResp100 | se(Standardized.SE, sigma = TRUE) ~ 
+       e0 * (1 - emax*log10_1_umol_L^lambda /
+       (e50^lambda+log10_1_umol_L^lambda)),
+     e0 ~ 1 + (1|Pollutant), emax ~ 1 + (1|Pollutant), 
+     e50 ~ 1 + (1|RefID/RefIDExp) + (1|Pollutant), 
+     lambda ~ 1 + (1|Pollutant),
+     nl = TRUE),
+  data = metal.fert2,
+  family = gaussian(),
+  prior = c(
+    prior(normal(100,10), nlpar = "e0", lb = 0, ub = 100),
+    prior(normal(0.5,0.2), nlpar = "emax", lb = 0, ub = 1),
+    prior(normal(2, 1), nlpar = "e50", lb = 0, ub = 5),
+    prior(normal(0, 10), nlpar = "lambda", lb = 0)
+  ), control = list(adapt_delta = 0.999999, max_treedepth = 20),
+  cores = 4, chains = 4, iter = 2000, warmup = 1000, seed=19012018)
+```
+  
+#### a. Bayesian model summary
+  
+```{r, echo=FALSE}
+summary(fit_metal.fert)
+10^(fixef(fit_metal.fert)[3,1]) - 1 #EC50 35.7 umol/L (model average not of interest)
+posterior_summary(fit_metal.fert)
+bayes_R2(fit_metal.fert) #0.915
+```
+
+Results look clean and no warnings from the models. 
+  
+#### b. MOLAR - Plots of Bayesian model results and EC50 posterior distributions by article
+  
+```{r, echo=FALSE, warning=FALSE}
+# Assign model of choice:
+mod <- fit_metal.fert
+mod_fixef <- fixef(mod)
+
+# Group-specific effects are deviations + average
+out_r_e0 <- mod %>% 
+  spread_draws(r_Pollutant__e0[Pollutant,term], b_e0_Intercept) %>% 
+  mutate(b_e0_Intercept = r_Pollutant__e0 + b_e0_Intercept)
+out_r_emax <- mod %>% 
+  spread_draws(r_Pollutant__emax[Pollutant,term], b_emax_Intercept) %>% 
+  mutate(b_emax_Intercept = r_Pollutant__emax + b_emax_Intercept) 
+out_r_e50 <- mod %>% 
+  spread_draws(r_Pollutant__e50[Pollutant,term], b_e50_Intercept) %>% 
+  mutate(b_e50_Intercept = r_Pollutant__e50 + b_e50_Intercept) 
+out_r_lambda <- mod %>% 
+  spread_draws(r_Pollutant__lambda[Pollutant,term], b_lambda_Intercept) %>% 
+  mutate(b_lambda_Intercept = r_Pollutant__lambda + b_lambda_Intercept) 
+
+# Data frames of summary numbers
+out_all_sum_e0 <- out_r_e0 %>% group_by(Pollutant) %>% 
+  mean_qi(b_e0_Intercept)
+out_all_sum_emax <- out_r_emax %>% group_by(Pollutant) %>% 
+  mean_qi(b_emax_Intercept)
+out_all_sum_e50 <- out_r_e50 %>% group_by(Pollutant) %>% 
+  mean_qi(b_e50_Intercept)
+out_all_sum_lambda <- out_r_lambda %>% group_by(Pollutant) %>% 
+  mean_qi(b_lambda_Intercept)
+
+# Renaming beta values for all parameters and groupings
+e0_fit_mfert <- out_all_sum_e0$b_e0_Intercept
+emax_fit_mfert <- out_all_sum_emax$b_emax_Intercept
+e50_fit_mfert <- out_all_sum_e50$b_e50_Intercept
+e50_trans <- 10^(e50_fit_mfert) - 1
+lambda_fit_mfert <- out_all_sum_lambda$b_lambda_Intercept
+
+# Equations for group-level values of all parameters
+equ_group1 <- function(x){
+  e0_fit_mfert[1] * (1 - emax_fit_mfert[1]*x^lambda_fit_mfert[1]/
+       (e50_trans[1]^lambda_fit_mfert[1] + x^lambda_fit_mfert[1]))}
+equ_group2 <- function(x){
+  e0_fit_mfert[2] * (1 - emax_fit_mfert[2]*x^lambda_fit_mfert[2]/
+       (e50_trans[2]^lambda_fit_mfert[2] + x^lambda_fit_mfert[2]))}
+equ_group3 <- function(x){
+  e0_fit_mfert[3] * (1 - emax_fit_mfert[3]*x^lambda_fit_mfert[3]/
+       (e50_trans[3]^lambda_fit_mfert[3] + x^lambda_fit_mfert[3]))}
+equ_group4 <- function(x){
+  e0_fit_mfert[4] * (1 - emax_fit_mfert[4]*x^lambda_fit_mfert[4]/
+       (e50_trans[4]^lambda_fit_mfert[4] + x^lambda_fit_mfert[4]))}
+equ_group5 <- function(x){
+  e0_fit_mfert[5] * (1 - emax_fit_mfert[5]*x^lambda_fit_mfert[5]/
+       (e50_trans[5]^lambda_fit_mfert[5] + x^lambda_fit_mfert[5]))}
+equ_group6 <- function(x){
+  e0_fit_mfert[6] * (1 - emax_fit_mfert[6]*x^lambda_fit_mfert[6]/
+       (e50_trans[6]^lambda_fit_mfert[6] + x^lambda_fit_mfert[6]))}
+equ_group7 <- function(x){
+  e0_fit_mfert[7] * (1 - emax_fit_mfert[7]*x^lambda_fit_mfert[7]/
+       (e50_trans[7]^lambda_fit_mfert[7] + x^lambda_fit_mfert[7]))}
+equ_group8 <- function(x){
+  e0_fit_mfert[8] * (1 - emax_fit_mfert[8]*x^lambda_fit_mfert[8]/
+       (e50_trans[8]^lambda_fit_mfert[8] + x^lambda_fit_mfert[8]))}
+equ_group9 <- function(x){
+  e0_fit_mfert[9] * (1 - emax_fit_mfert[9]*x^lambda_fit_mfert[9]/
+       (e50_trans[9]^lambda_fit_mfert[9] + x^lambda_fit_mfert[9]))}
+equ_group10 <- function(x){
+  e0_fit_mfert[10] * (1 - emax_fit_mfert[10]*x^lambda_fit_mfert[10]/
+       (e50_trans[10]^lambda_fit_mfert[10] + x^lambda_fit_mfert[10]))}
+
+# color blind palette:
+cbPalette <- c("#999999", "#56B4E9", "#E69F00", "#009E73", "#D55E00", "#0072B2", "#F0E442", "#CC79A7", "6A0DAD", "#000000") 
+
+## Bayesian model results plot
+plot_brm_metal.fert2 <- ggplot(data = metal.fert2,
+       aes(x = level.umol.L, y = StdResp100)) +
+  stat_function(fun = equ_group1, color = cbPalette[1]) +
+  stat_function(fun = equ_group2, color = cbPalette[2]) +
+  stat_function(fun = equ_group3, color = cbPalette[3]) +
+  stat_function(fun = equ_group4, color = cbPalette[4]) +
+  stat_function(fun = equ_group5, color = cbPalette[5]) +
+  stat_function(fun = equ_group6, color = cbPalette[6]) +
+  stat_function(fun = equ_group7, color = cbPalette[7]) +
+  stat_function(fun = equ_group8, color = cbPalette[8]) +
+  stat_function(fun = equ_group9, color = cbPalette[9]) +
+  stat_function(fun = equ_group10, color = cbPalette[10]) +
+  geom_point(data = metal.fert2, aes(color = Pollutant)) +
+  labs(x = expression("Metal exposure concentration ("*mu*"mol/L)"), 
+       y = "Fertilization success (%)",
+       color = "Metal") +
+  scale_x_log10(limits = c(0.001,10000), 
+                breaks=c(0.001,0.01,0.1,1,10,100,1000,10000), 
+                label=c("0.001","0.01","0.1","1","10","100","1000","10000")) +
+  theme_classic() + scale_colour_manual(values=cbPalette)
+
+plot_brm_metal.fert2
+
+#Rearrange by order of EC50 values
+out_all_sum_e50_2 <- out_all_sum_e50 %>%  
+  arrange(desc(b_e50_Intercept))
+order_metal_e50 <- out_all_sum_e50_2$Pollutant
+out_r_e50 <- out_r_e50 %>%
+  mutate(Pollutant = factor(Pollutant, levels = order_metal_e50)) %>%
+  arrange(Pollutant)
+
+#Back-transform EC50 values
+out_all_sum_e50 <- out_all_sum_e50 %>% 
+  mutate(b_e50_Intercept_tr = 10^(b_e50_Intercept) - 1) %>% 
+  mutate(lower_tr = 10^(.lower) - 1) %>%
+  mutate(upper_tr = 10^(.upper) - 1)
+
+# EC50 Plot
+plot_EC50_metal.fert2 <- out_r_e50 %>%  
+  ggplot(aes(b_e50_Intercept, Pollutant)) +
+  geom_density_ridges(
+    rel_min_height = 0.01, 
+    col = NA,
+    scale = 1) +
+  geom_pointintervalh(
+    data = out_all_sum_e50, size = 1) +
+  geom_text(
+    data = mutate_if(out_all_sum_e50, is.numeric, round, 1),
+    # Use glue package to combine strings
+    aes(label = glue::glue("{b_e50_Intercept_tr} [{lower_tr}, {upper_tr}]"), x = Inf),
+    hjust = "inward", size = 3) +
+  labs(x = expression(paste("E", C[50], " posterior distribution (", mu, "mol/L)")),
+       y = "Metal") +
+  scale_x_continuous(limits = c(-0.25,5),
+                     breaks=c(0,1,2,3,4), 
+                     label=c("1","10","100","1000","10,000"))  +
+  theme_classic() + theme(panel.grid.major.y = element_blank())
+
+plot_EC50_metal.fert2
+```
+  
+  
+### 7. PLOTS & TABLES FOR MANUSCRIPT
+  
+```{r, echo=FALSE, warning=FALSE}
+#UNCOMMENT annotate_figure(), ggexport() and save_kable() objects when want to update figures
+#component figures have faint lines for different articles/experiments
+fig1 <- ggarrange(plot_brm_copper.fert2, plot_brm_copper.larvsurv2, 
+                  plot_brm_copper.larvsett2, plot_brm_copper.fvfm2,
+                  labels = c("A", "B", "C", "D"),
+                  ncol = 2, nrow = 2)
+#annotate_figure(fig1,
+#  bottom = text_grob(expression("Copper exposure concentration ("*mu*"g/L)"))) %>%
+#  ggexport(filename = "fig1.pdf", width = 6, height = 5)
+
+fig2 <- ggarrange(plot_brm_metal.fert2, plot_EC50_metal.fert2,
+                  labels = c("A", "B"),
+                  ncol = 1, nrow = 2)
+#fig2 %>% ggexport(filename = "fig2.pdf", width = 6, height = 6)
+
+fig3 <- ggarrange(plot_brm_diuron.fvfm2, diuron.fvfm_plot,
+                  labels = c("A", "B"),
+                  ncol = 2, nrow = 1)
+#fig3 %>% ggexport(filename = "fig3.pdf", width = 6, height = 3)
+
+ECx_df <- rbind(Cu_fert_df, Cu_larvsett_df, Cu_larvsurv_df,
+                Cu_fvfm_df, Di_fvfm_df)
+table_ECx <- kbl(ECx_df, align = "l", 
+    col.names = c("Coral age class", "Coral response", "Pollutant", 
+                  "ECx", "Estimate", "Q2.5", "Q97.5")) %>%
+  kable_paper(full_width = F) %>%
+  column_spec(1, bold = T) %>%
+  collapse_rows(columns = 1:2, valign = "top")
+#table_ECx %>%
+#  kable_paper() %>%
+#  save_kable(file = "table_ECx.html", self_contained = T)
+
+fig1
+fig2
+fig3
+table_ECx
+```
+
+
+## B. Datasets not suitable for Bayesian meta-analysis with brms models
+  
+### 1. brms with Copper - adult chl-a concentration, ug/cm2 - NOT SUITABLE
+  
+Let's plot the raw data to assess whether the non-linear, Emax model parameterization would be appropriate...
+  
+```{r, echo=FALSE, warning=FALSE}
+# COPPER concentration vs. CHL-A CONC, UG/CM2
+copper.chla.ug.cm2.conc <- ggplot(copper.chla.ug.cm2, 
+                           aes(x = level.converted.to.ug.L,
+                               y = Standardized.response.level,
+                               color = RefIDExp,
+                               ymin = Standardized.response.level-Standardized.SD,
+                               ymax = Standardized.response.level+Standardized.SD)) + 
+  geom_pointrange() +
+  ggtitle("Copper - chlorphyll a concentration") +
+  labs(x = "Copper concentration (ug/L)",
+       y = "Chl-a concentration (ug/cm2)",
+       color = "Experiment") +
+  theme_classic() + scale_x_log10()
+
+copper.chla.ug.cm2.conc + geom_smooth(method = lm, se = FALSE) #linear fit
+copper.chla.ug.cm2.conc + geom_smooth(method = loess, se = FALSE) #smooth (non-linear) fit
+copper.chla.ug.cm2.conc
+ggplotly(copper.chla.ug.cm2.conc)
+```
+  
+There is no clear pattern in these data that might indicate a relationship between copper concentration and chlorophyll-a concentration. Therefore, we will not pursue modeling.
+  
+### 2. brms with Copper - adult chl-a concentration, pg/cell - NOT SUITABLE
+  
+Let's plot the raw data to assess whether the non-linear, Emax model parameterization would be appropriate...
+  
+```{r, echo=FALSE, warning=FALSE}
+# COPPER concentration vs. CHL-A CONC, PG/CELL
+copper.chla.pg.cell.conc <- ggplot(copper.chla.pg.cell, 
+                           aes(x = level.converted.to.ug.L,
+                               y = Standardized.response.level,
+                               color = RefIDExp,
+                               ymin = Standardized.response.level-Standardized.SD,
+                               ymax = Standardized.response.level+Standardized.SD)) + 
+  geom_pointrange() +
+  ggtitle("Copper - chlorphyll a concentration") +
+  labs(x = "Copper concentration (ug/L)",
+       y = "Chl-a concentration (pg/cell)",
+       color = "Experiment") +
+  theme_classic() + scale_x_log10()
+
+copper.chla.pg.cell.conc + geom_smooth(method = lm, se = FALSE) #linear fit
+copper.chla.pg.cell.conc + geom_smooth(method = loess, se = FALSE) #smooth (non-linear) fit
+copper.chla.pg.cell.conc
+ggplotly(copper.chla.pg.cell.conc) #so that I can isolate particular experiments
+```
+  
+There is no clear pattern in these data that might indicate a relationship between copper concentration and chlorophyll-a concentration. Therefore, we will not pursue modeling.
+  
+  
+# Citations for packages and other session info:
+
+```{r}
+citation(package = "brms")
+packageVersion("brms") #version 2.14.0
+
+citation(package = "rstan")
+packageVersion("rstan") #version 2.21.2
+
+sessionInfo()
+citation()
+#R version 4.0.1
+```
+  
