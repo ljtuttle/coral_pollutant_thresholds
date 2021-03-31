@@ -35,11 +35,11 @@ pollute <- as.data.frame(read.csv("./pollution_data.csv", header=TRUE))
 pollute <- pollute %>% #converting appropriate columns to numeric...
   mutate_at(vars(level.converted.to.ug.L, N.for.computing.average, 
                  exposure.duration.in.days, Standardized.response.level, 
-                 Standardized.SE, Standardized.SD, N.for.computing.average.1,
+                 Standardized.SE, Standardized.SD, N.for.computing.average,
                  Time.to.response..numeric, Duration.of.response..numeric), as.character) %>% 
   mutate_at(vars(level.converted.to.ug.L, N.for.computing.average, 
                  exposure.duration.in.days, Standardized.response.level, 
-                 Standardized.SE, Standardized.SD, N.for.computing.average.1,
+                 Standardized.SE, Standardized.SD, N.for.computing.average,
                  Time.to.response..numeric, Duration.of.response..numeric), as.numeric)
 
 # creating new columns for:
@@ -52,7 +52,7 @@ pollute <- pollute %>%
   mutate(log10_1_ug_L = log10(level.converted.to.ug.L + 1)) %>% 
 # 4) "cumulative exposure" = concentration*duration
   mutate(CumExp = level.converted.to.ug.L*exposure.duration.in.days) %>%
-  select(RefID, RefIDExp, CONTROL, Pollutant.Class, Pollutant, Response.type, Current.genus.name, Gsp, Coral.age.class, level.converted.to.ug.L, log10_1_ug_L, CumExp, exposure.duration.in.days, Standardized.unit.of.measurement, Standardized.response.level, Standardized.SE, Standardized.SD, N.for.computing.average.1) %>%
+  select(RefID, RefIDExp, CONTROL, Pollutant.Class, Pollutant, Response.type, Current.genus.name, Gsp, Coral.age.class, level.converted.to.ug.L, log10_1_ug_L, CumExp, exposure.duration.in.days, Standardized.UoM, Standardized.response.level, Standardized.SE, Standardized.SD, N.for.computing.average) %>%
 # 5) conversion factor (multiplier) from ug/L to umol/L
   mutate(
     ug.to.umol.mult = case_when(
@@ -97,9 +97,9 @@ copper.larvswim <- pollute %>%
 copper.chla <- pollute %>% filter(Response.type == "chl-a concentration") %>% 
   filter(Pollutant == "Copper")
 copper.chla.ug.cm2 <- copper.chla %>% 
-  filter(Standardized.unit.of.measurement == "ug/cm2")
+  filter(Standardized.UoM == "ug/cm2")
 copper.chla.pg.cell <- copper.chla %>% 
-  filter(Standardized.unit.of.measurement == "pg/cell")
+  filter(Standardized.UoM == "pg/cell")
 copper.fvfm <- pollute %>% 
   filter(Response.type == "maximum quantum yield - Fv/Fm") %>% 
   filter(Pollutant == "Copper") %>% 
